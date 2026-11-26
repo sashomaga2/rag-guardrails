@@ -6,6 +6,12 @@ when it can't help. Seven guardrail layers protect it,
 including guardrails that work **while the answer streams**. Each layer is measured by an evaluation
 suite that runs locally (CI gate) and in LangSmith (experiments).
 
+**[Interactive architecture diagrams →](https://sashomaga2.github.io/rag-guardrails/architecture.html)**
+Seven diagrams: the pipeline, hybrid retrieval, guardrail layers, guarded streaming, live-agent
+handoff, deployment and eval gates.
+
+[![Request pipeline: guardrails, hybrid retrieval with reranking, generation, verification, corrective retry and handoff](docs/architecture-preview.jpg)](https://sashomaga2.github.io/rag-guardrails/architecture.html)
+
 ```
         ┌──────────── input guardrails ─────────────┐   ┌─ retrieval guardrails ─┐
 START → prepare ─┬→ classify_input (regex → LLM) ─┬→ gate ─→ refuse ───────────────────────→ END
@@ -519,6 +525,7 @@ src/northwind_rag/
 evals/                 dataset · evaluators · run_local (CI gate) · run_langsmith (experiments)
 tests/                 patterns, streaming property tests, pipeline, SSE API
 data/docs/             knowledge base (incl. one leaked key and one poisoned page, on purpose)
+docs/                  architecture.html: interactive diagrams, published with GitHub Pages
 ```
 
 ## Tuning notes
