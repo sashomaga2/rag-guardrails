@@ -1,0 +1,106 @@
+# Full system on one machine:  docker compose up --build   ->  http://localhost:8080
+# Offline (no keys):           RAG_OFFLINE=true docker compose up --build
+# Two API replicas sharing the Redis limits:  docker compose up --build --scale api=2  (remove the host port first)
+
+x-app-env: &app-env
+  RAG_OFFLINE: ${RAG_OFFLINE:-false}
+  RAG_REDIS_URL: redis://redis:6379/0
+  RAG_CHROMA_HOST: chroma
+  RAG_CHROMA_PORT: "8000"
+  RAG_RETRIEVAL_MODE: hybrid
+  RAG_ELASTICSEARCH_URL: http://elasticsearch:9200
+  RAG_DATABASE_URL: postgresql://northwind:northwind@postgres:5432/northwind
+  RAG_AUTO_INGEST: "false"
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  RAG_AGENT_WEBHOOK_SECRET: ${RAG_AGENT_WEBHOOK_SECRET:-local-dev-secret}
+  LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+  LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+  LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-northwind-rag}
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    # limiter state is short-lived: no persistence; never evict keys (an evicted lease = a lost limit)
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  chroma:
+    image: chromadb/chroma:1.5.9  # keep in step with the chromadb client version
+    volumes:
+      - chroma-data:/data
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"  # local only; see k8s/base/elasticsearch.yaml for production notes
+      node.store.allow_mmap: "false"  # no vm.max_map_count tuning needed on the host
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: northwind
+      POSTGRES_USER: northwind
+      POSTGRES_PASSWORD: northwind  # local only
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "northwind", "-d", "northwind"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: .
+    command: ["python", "-m", "northwind_rag.cli", "migrate"]
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  ingest:
+    build: .
+    command: ["python", "-m", "northwind_rag.cli", "ingest"]
+    environment: *app-env
+    depends_on:
+      chroma:
+        condition: service_started
+      elasticsearch:
+        condition: service_healthy
+    restart: on-failure:5  # chroma may need a few seconds before it accepts connections
+
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment: *app-env
+    depends_on:
+      redis:
+        condition: service_healthy
+      ingest:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/readyz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    stop_grace_period: 60s
+
+volumes:
+  chroma-data:
+  es-data:
+  pg-data:

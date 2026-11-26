@@ -1,0 +1,50 @@
+# Dev / local cluster (kind, minikube, Docker Desktop): 1 replica, offline models, no JWT.
+#   kubectl apply -k k8s/overlays/dev
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources: [../../base]
+namespace: northwind-rag
+images:
+  - name: northwind-rag
+    newName: northwind-rag  # docker build -t northwind-rag:dev . (+ kind load docker-image)
+    newTag: dev
+configMapGenerator:
+  - name: rag-config
+    behavior: merge
+    literals:
+      - RAG_OFFLINE=true
+      - LANGSMITH_TRACING=false
+      - RAG_MAX_CONCURRENT_CHATS=10
+      - RAG_REQUIRE_USER_ID=false  # no identity provider in dev
+secretGenerator:
+  - name: rag-secrets
+    literals:
+      - OPENAI_API_KEY=unused-offline
+      - LANGSMITH_API_KEY=unused-offline
+      - RAG_AGENT_WEBHOOK_SECRET=dev-secret
+      - POSTGRES_PASSWORD=dev-password
+      - RAG_DATABASE_URL=postgresql://northwind:dev-password@postgres:5432/northwind
+patches:
+  - target: {kind: Deployment, name: rag-api}
+    patch: |-
+      - {op: replace, path: /spec/replicas, value: 1}
+  - target: {kind: HorizontalPodAutoscaler, name: rag-api}
+    patch: |-
+      - {op: replace, path: /spec/minReplicas, value: 1}
+      - {op: replace, path: /spec/maxReplicas, value: 2}
+  - target: {kind: PodDisruptionBudget, name: rag-api}
+    patch: |-
+      - {op: replace, path: /spec/minAvailable, value: 0}
+  # no identity provider in dev: drop JWT enforcement
+  - target: {kind: AuthorizationPolicy, name: rag-api-require-jwt}
+    patch: |-
+      $patch: delete
+      apiVersion: security.istio.io/v1
+      kind: AuthorizationPolicy
+      metadata: {name: rag-api-require-jwt}
+  - target: {kind: RequestAuthentication, name: rag-api-jwt}
+    patch: |-
+      $patch: delete
+      apiVersion: security.istio.io/v1
+      kind: RequestAuthentication
+      metadata: {name: rag-api-jwt}

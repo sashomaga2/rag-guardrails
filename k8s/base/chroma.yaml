@@ -1,0 +1,57 @@
+# Chroma server: the shared vector store. A StatefulSet with its own volume, because the
+# index is state. API pods are stateless and talk to it over HTTP (RAG_CHROMA_HOST).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: chroma
+  labels: {app: chroma}
+spec:
+  serviceName: chroma
+  replicas: 1
+  selector:
+    matchLabels: {app: chroma}
+  template:
+    metadata:
+      labels: {app: chroma}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: chroma
+          image: chromadb/chroma:1.5.9  # keep in step with the chromadb client in the api image
+          ports:
+            - {name: http, containerPort: 8000}
+          readinessProbe:
+            httpGet: {path: /api/v2/heartbeat, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /api/v2/heartbeat, port: http}
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {memory: 2Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests: {storage: 5Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chroma
+  labels: {app: chroma}
+spec:
+  selector: {app: chroma}
+  ports:
+    - {name: http, port: 8000, targetPort: http}

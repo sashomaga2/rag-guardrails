@@ -1,0 +1,89 @@
+# Default deny, then open exactly the paths the system needs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-from-ingress-gateway
+spec:
+  podSelector:
+    matchLabels: {app: rag-api}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: istio-system}
+          podSelector:
+            matchLabels: {istio: ingressgateway}
+      ports:
+        - {port: 8080, protocol: TCP}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-from-api
+spec:
+  podSelector:
+    matchLabels: {app: redis}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: rag-api}
+      ports:
+        - {port: 6379, protocol: TCP}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-from-db-clients
+spec:
+  podSelector:
+    matchLabels: {app: postgres}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {db-client: "true"}  # api, migrate job, purge + sweep cronjobs
+      ports:
+        - {port: 5432, protocol: TCP}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: elasticsearch-from-api-and-ingest
+spec:
+  podSelector:
+    matchLabels: {app: elasticsearch}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: rag-api}
+        - podSelector:
+            matchLabels: {app: rag-ingest}
+      ports:
+        - {port: 9200, protocol: TCP}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: chroma-from-api-and-ingest
+spec:
+  podSelector:
+    matchLabels: {app: chroma}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: rag-api}
+        - podSelector:
+            matchLabels: {app: rag-ingest}
+      ports:
+        - {port: 8000, protocol: TCP}

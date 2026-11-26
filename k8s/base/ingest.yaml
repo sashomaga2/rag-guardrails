@@ -1,0 +1,87 @@
+# Indexing runs as a separate workload, never inside API pods:
+#   Job      - once per deploy (kustomize gives it a fresh name via the overlay's nameSuffix/hash)
+#   CronJob  - re-syncs every night so the index can't silently go stale. Ingestion is
+#              idempotent: unchanged chunks are upserted in place, removed ones are deleted.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rag-ingest
+spec:
+  backoffLimit: 4
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels: {app: rag-ingest}
+      annotations:
+        sidecar.istio.io/nativeSidecar: "true"  # sidecar exits with the job (k8s >= 1.29)
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: ingest
+          image: northwind-rag:latest
+          command: ["python", "-m", "northwind_rag.cli", "ingest"]
+          envFrom:
+            - configMapRef: {name: rag-config}
+            - secretRef: {name: rag-secrets}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 768Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: rag-reindex
+spec:
+  schedule: "17 2 * * *"  # 02:17 daily
+  timeZone: Europe/Sofia
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels: {app: rag-ingest}
+          annotations:
+            sidecar.istio.io/nativeSidecar: "true"
+        spec:
+          restartPolicy: OnFailure
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: ingest
+              image: northwind-rag:latest
+              command: ["python", "-m", "northwind_rag.cli", "ingest"]
+              envFrom:
+                - configMapRef: {name: rag-config}
+                - secretRef: {name: rag-secrets}
+              resources:
+                requests: {cpu: 100m, memory: 256Mi}
+                limits: {memory: 768Mi}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: ["ALL"]}
+              volumeMounts:
+                - {name: tmp, mountPath: /tmp}
+          volumes:
+            - name: tmp
+              emptyDir: {}

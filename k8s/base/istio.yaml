@@ -1,0 +1,130 @@
+# Edge: (CDN / load balancer) -> Istio ingress gateway -> rag-api sidecar -> app
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: rag-gateway
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - port: {number: 443, name: https, protocol: HTTPS}
+      hosts: ["chat.northwind.example"]
+      tls:
+        mode: SIMPLE
+        credentialName: chat-northwind-tls  # TLS secret in istio-system (e.g. from cert-manager)
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: rag-api
+spec:
+  hosts: ["chat.northwind.example"]
+  gateways: [rag-gateway]
+  http:
+    - name: stream
+      match:
+        - uri: {exact: /chat/stream}
+      route:
+        - destination: {host: rag-api, port: {number: 80}}
+      timeout: 120s  # SSE: generation (60s) + verification + handoff
+      retries: {attempts: 0}  # never replay a POST that may already be generating (cost, duplicates)
+    - name: agent-websocket  # long-lived; Istio upgrades WebSockets on HTTP routes by default
+      match:
+        - uri: {regex: "^/conversations/[^/]+/ws$"}
+      route:
+        - destination: {host: rag-api, port: {number: 80}}
+      timeout: 0s  # no route timeout; app pings every 15s, the client resumes with last_event_id
+    - name: agent-webhook  # from the support desk; authenticated by HMAC signature in the app
+      match:
+        - uri: {exact: /agent/webhook}
+      route:
+        - destination: {host: rag-api, port: {number: 80}}
+      timeout: 10s
+      retries: {attempts: 2, retryOn: "connect-failure,refused-stream,unavailable"}
+    - name: chat
+      match:
+        - uri: {prefix: /chat}
+        - uri: {exact: /handoff}
+        - uri: {regex: "^/conversations/[^/]+/ws-ticket$"}
+      route:
+        - destination: {host: rag-api, port: {number: 80}}
+      timeout: 90s
+      retries: {attempts: 0}
+    - name: ui
+      route:
+        - destination: {host: rag-api, port: {number: 80}}
+      timeout: 10s
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: rag-api
+spec:
+  host: rag-api
+  trafficPolicy:
+    tls: {mode: ISTIO_MUTUAL}
+    loadBalancer: {simple: LEAST_REQUEST}  # long streams: send new chats to the least busy pod
+    connectionPool:
+      http:
+        http1MaxPendingRequests: 200
+        maxRequestsPerConnection: 0
+    outlierDetection:
+      consecutive5xxErrors: 20  # 503 "busy" is expected backpressure; only eject truly broken pods
+      interval: 30s
+      baseEjectionTime: 60s
+      maxEjectionPercent: 34
+---
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: strict-mtls
+spec:
+  mtls: {mode: STRICT}
+---
+# The user id used for per-user limits comes from the verified JWT, never from the client:
+# outputClaimToHeaders writes the "sub" claim into X-User-Id (overwriting any client value).
+apiVersion: security.istio.io/v1
+kind: RequestAuthentication
+metadata:
+  name: rag-api-jwt
+spec:
+  selector:
+    matchLabels: {app: rag-api}
+  jwtRules:
+    - issuer: https://login.northwind.example/
+      jwksUri: https://login.northwind.example/.well-known/jwks.json
+      forwardOriginalToken: false
+      outputClaimToHeaders:
+        - {header: X-User-Id, claim: sub}
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: rag-api-require-jwt
+spec:
+  selector:
+    matchLabels: {app: rag-api}
+  action: ALLOW
+  rules:
+    - to:  # probes and the static UI are public
+        - operation:
+            paths: ["/livez", "/readyz", "/"]
+    - from:  # chat endpoints need a valid token
+        - source:
+            requestPrincipals: ["*"]
+      to:
+        - operation:
+            paths: ["/chat", "/chat/stream", "/handoff"]
+            methods: ["POST"]
+        - operation:  # ws-ticket: needs the user's JWT
+            paths: ["/conversations/*"]
+            methods: ["POST"]
+    - to:  # WebSocket upgrade: browsers can't send the JWT, the app checks the single-use ticket
+        - operation:
+            paths: ["/conversations/*"]
+            methods: ["GET"]
+    - to:  # desk webhook: no user JWT, verified by HMAC in the app.
+        # Tighten further with `from: source: remoteIpBlocks: [<desk egress IPs>]`.
+        - operation:
+            paths: ["/agent/webhook"]
+            methods: ["POST"]

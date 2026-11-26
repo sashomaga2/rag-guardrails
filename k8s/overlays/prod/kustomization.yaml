@@ -1,0 +1,30 @@
+# Production: pinned image digest, more replicas. The rag-secrets Secret must already exist
+# (created from Vault / External Secrets), it is intentionally not generated here.
+#   kubectl -n northwind-rag delete job rag-ingest rag-migrate --ignore-not-found   # Jobs are immutable
+#   kubectl apply -k k8s/overlays/prod
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources: [../../base]
+namespace: northwind-rag
+images:
+  - name: northwind-rag
+    newName: registry.northwind.example/northwind-rag
+    newTag: "1.0.0"  # prefer a digest: digest: sha256:...
+configMapGenerator:
+  - name: rag-config
+    behavior: merge
+    literals:
+      - LANGSMITH_PROJECT=northwind-rag-prod
+patches:
+  - target: {kind: HorizontalPodAutoscaler, name: rag-api}
+    patch: |-
+      - {op: replace, path: /spec/maxReplicas, value: 20}
+  - target: {kind: StatefulSet, name: elasticsearch}
+    patch: |-
+      - {op: replace, path: /spec/volumeClaimTemplates/0/spec/resources/requests/storage, value: 50Gi}
+  - target: {kind: StatefulSet, name: postgres}
+    patch: |-
+      - {op: replace, path: /spec/volumeClaimTemplates/0/spec/resources/requests/storage, value: 50Gi}
+  - target: {kind: StatefulSet, name: chroma}
+    patch: |-
+      - {op: replace, path: /spec/volumeClaimTemplates/0/spec/resources/requests/storage, value: 20Gi}

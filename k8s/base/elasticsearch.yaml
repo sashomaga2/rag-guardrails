@@ -1,0 +1,70 @@
+# Elasticsearch: the BM25 (keyword) half of hybrid retrieval. Single node is enough for a
+# knowledge base of this size: the index is fully rebuildable from the docs by the ingest Job.
+#
+# Production: run it with the ECK operator or Elastic Cloud (3 nodes, replicas >= 1, TLS and
+# security on) and give the app an API key: RAG_ELASTICSEARCH_URL=https://... and
+# RAG_ELASTICSEARCH_API_KEY in the rag-secrets Secret. Inside this namespace, traffic is already
+# mTLS-encrypted by Istio and restricted by NetworkPolicy to the api and ingest pods.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: elasticsearch
+  labels: {app: elasticsearch}
+spec:
+  serviceName: elasticsearch
+  replicas: 1
+  selector:
+    matchLabels: {app: elasticsearch}
+  template:
+    metadata:
+      labels: {app: elasticsearch}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: elasticsearch
+          image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0  # same major as the Python client
+          env:
+            - {name: discovery.type, value: single-node}
+            - {name: xpack.security.enabled, value: "false"}
+            - {name: node.store.allow_mmap, value: "false"}  # avoids the privileged vm.max_map_count init container
+            - {name: ES_JAVA_OPTS, value: "-Xms1g -Xmx1g"}  # heap = half the memory limit
+          ports:
+            - {name: http, containerPort: 9200}
+          readinessProbe:
+            httpGet: {path: "/_cluster/health?local=true", port: http}
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket: {port: http}
+            initialDelaySeconds: 60
+            periodSeconds: 20
+          resources:
+            requests: {cpu: 500m, memory: 2Gi}
+            limits: {memory: 2Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: data, mountPath: /usr/share/elasticsearch/data}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests: {storage: 10Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch
+  labels: {app: elasticsearch}
+spec:
+  selector: {app: elasticsearch}
+  ports:
+    - {name: http, port: 9200, targetPort: http}

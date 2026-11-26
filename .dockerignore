@@ -1,0 +1,12 @@
+.env
+.git
+.github
+.chroma
+**/__pycache__
+**/*.egg-info
+.pytest_cache
+.venv
+tests
+evals
+k8s
+docker-compose.yml

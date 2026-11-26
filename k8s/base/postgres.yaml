@@ -1,0 +1,73 @@
+# PostgreSQL: system of record for conversations and their durable owner.
+# Single instance with a volume is fine for dev and small deployments. For production use a
+# managed database (RDS / Cloud SQL / Azure Flexible Server) or the CloudNativePG operator
+# (replicas, automated failover, PITR backups); only RAG_DATABASE_URL in rag-secrets changes.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  labels: {app: postgres}
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: {app: postgres}
+  template:
+    metadata:
+      labels: {app: postgres}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70  # "postgres" user in the alpine image
+        runAsGroup: 70
+        fsGroup: 70
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - {name: POSTGRES_DB, value: northwind}
+            - {name: POSTGRES_USER, value: northwind}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: rag-secrets, key: POSTGRES_PASSWORD}}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}  # subdir: volume root has lost+found
+          args: ["-c", "max_connections=200", "-c", "shared_buffers=256MB"]
+          ports:
+            - {name: postgres, containerPort: 5432}
+          readinessProbe:
+            exec: {command: ["pg_isready", "-U", "northwind", "-d", "northwind"]}
+            periodSeconds: 5
+          livenessProbe:
+            exec: {command: ["pg_isready", "-U", "northwind", "-d", "northwind"]}
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: run, mountPath: /var/run/postgresql}
+      volumes:
+        - name: run
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests: {storage: 10Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels: {app: postgres}
+spec:
+  selector: {app: postgres}
+  ports:
+    - {name: tcp-postgres, port: 5432, targetPort: postgres}

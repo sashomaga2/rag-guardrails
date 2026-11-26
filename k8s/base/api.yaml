@@ -1,0 +1,118 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rag-api
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-api
+  labels: {app: rag-api}
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}  # never drop capacity during a rollout
+  selector:
+    matchLabels: {app: rag-api}
+  template:
+    metadata:
+      labels: {app: rag-api, db-client: "true"}
+      annotations:
+        # app starts only after Envoy is ready, and Envoy waits for open streams on shutdown
+        proxy.istio.io/config: |
+          holdApplicationUntilProxyStarts: true
+          terminationDrainDuration: 60s
+    spec:
+      serviceAccountName: rag-api
+      terminationGracePeriodSeconds: 90  # preStop 10s + uvicorn graceful 60s + margin
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector: {matchLabels: {app: rag-api}}
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector: {matchLabels: {app: rag-api}}
+      containers:
+        - name: api
+          image: northwind-rag:latest  # set per environment by kustomize `images:`
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8080}
+          envFrom:
+            - configMapRef: {name: rag-config}
+            - secretRef: {name: rag-secrets}
+          startupProbe:
+            httpGet: {path: /livez, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:  # process only: dependency outages must not restart healthy pods
+            httpGet: {path: /livez, port: http}
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:  # Redis + Chroma reachable, else taken out of the Service
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            failureThreshold: 2
+          lifecycle:
+            preStop:  # let endpoints/Envoy stop routing new requests before shutdown starts
+              exec: {command: ["sleep", "10"]}
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-api
+  labels: {app: rag-api}
+spec:
+  selector: {app: rag-api}
+  ports:
+    - {name: http, port: 80, targetPort: http}
+---
+# CPU is a weak signal for an I/O-bound LLM service; it is a safe default. Better: scale on
+# in-flight chats (export limiter.in_use("chats") as a Prometheus metric + KEDA/prometheus-adapter).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rag-api
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: rag-api}
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 70}
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300  # long-lived streams: scale down slowly
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rag-api
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels: {app: rag-api}

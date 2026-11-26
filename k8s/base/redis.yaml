@@ -1,0 +1,58 @@
+# Redis holds two kinds of short-lived state:
+#   - limiter leases (sorted sets, renewed while held)          -> rebuilt within seconds after a restart
+#   - live-agent conversation streams (capped, 24h TTL)         -> lost on restart without persistence
+# One replica without persistence is fine for dev. For production use a managed Redis or
+# Sentinel/HA with AOF so agent messages survive a Redis restart; only RAG_REDIS_URL changes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  labels: {app: redis}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: redis}
+  template:
+    metadata:
+      labels: {app: redis}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          args: ["--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+          ports:
+            - {name: redis, containerPort: 6379}
+          readinessProbe:
+            exec: {command: ["redis-cli", "ping"]}
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: {port: redis}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 320Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  labels: {app: redis}
+spec:
+  selector: {app: redis}
+  ports:
+    - {name: tcp-redis, port: 6379, targetPort: redis}

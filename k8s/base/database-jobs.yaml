@@ -1,0 +1,136 @@
+# migrate  - applies pending SQL migrations (advisory-locked, so parallel runs are safe).
+#            Run it before rolling out a new API version; API pods stay NOT ready until the schema
+#            is at the version they need (/readyz checks it), so nothing serves on an old schema.
+# purge    - nightly: deletes conversations idle longer than RAG_HISTORY_RETENTION_DAYS.
+# sweep    - every minute: questions saved as 'processing' whose pod died (no heartbeat for
+#            RAG_TURN_STALE_AFTER_S) are marked 'failed', so the client's retry can answer them.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rag-migrate
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels: {app: rag-migrate, db-client: "true"}
+      annotations:
+        sidecar.istio.io/nativeSidecar: "true"
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: migrate
+          image: northwind-rag:latest
+          command: ["python", "-m", "northwind_rag.cli", "migrate"]
+          envFrom:
+            - configMapRef: {name: rag-config}
+            - secretRef: {name: rag-secrets}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: rag-purge-history
+spec:
+  schedule: "43 3 * * *"  # 03:43 daily
+  timeZone: Europe/Sofia
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels: {app: rag-purge, db-client: "true"}
+          annotations:
+            sidecar.istio.io/nativeSidecar: "true"
+        spec:
+          restartPolicy: OnFailure
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: purge
+              image: northwind-rag:latest
+              command: ["python", "-m", "northwind_rag.cli", "purge"]
+              envFrom:
+                - configMapRef: {name: rag-config}
+                - secretRef: {name: rag-secrets}
+              resources:
+                requests: {cpu: 50m, memory: 128Mi}
+                limits: {memory: 256Mi}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: ["ALL"]}
+              volumeMounts:
+                - {name: tmp, mountPath: /tmp}
+          volumes:
+            - name: tmp
+              emptyDir: {}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: rag-sweep-stuck-questions
+spec:
+  schedule: "* * * * *"  # every minute: worst case a crashed question is free after stale + 60s
+  concurrencyPolicy: Forbid  # SKIP LOCKED makes overlaps safe anyway; this just avoids pile-ups
+  startingDeadlineSeconds: 30
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0  # next minute's run is the retry
+      activeDeadlineSeconds: 50
+      ttlSecondsAfterFinished: 600
+      template:
+        metadata:
+          labels: {app: rag-sweep, db-client: "true"}
+          annotations:
+            sidecar.istio.io/nativeSidecar: "true"
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: sweep
+              image: northwind-rag:latest
+              command: ["python", "-m", "northwind_rag.cli", "sweep"]
+              envFrom:
+                - configMapRef: {name: rag-config}
+                - secretRef: {name: rag-secrets}
+              resources:
+                requests: {cpu: 20m, memory: 96Mi}
+                limits: {memory: 192Mi}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: ["ALL"]}
+              volumeMounts:
+                - {name: tmp, mountPath: /tmp}
+          volumes:
+            - name: tmp
+              emptyDir: {}
