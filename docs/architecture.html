@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Northwind RAG — Architecture Diagrams</title>
+<style>
+  :root { --bg:#0b1020; --card:#131a2e; --border:#26314f; --text:#e6ebff; --muted:#93a0c4; --accent:#7c9cff; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:"Segoe UI",system-ui,sans-serif; background:radial-gradient(circle at 20% 0%,#1b2550 0%,var(--bg) 55%); color:var(--text); }
+  header { padding:40px 48px 16px; }
+  h1 { margin:0; font-size:34px; background:linear-gradient(90deg,#7c9cff,#c38bff,#ff8fb1); -webkit-background-clip:text; color:transparent; }
+  header p { color:var(--muted); margin:8px 0 0; font-size:15px; }
+  nav { display:flex; gap:10px; flex-wrap:wrap; padding:12px 48px 0; }
+  nav a { color:var(--text); text-decoration:none; padding:8px 14px; border:1px solid var(--border); border-radius:999px; background:var(--card); font-size:13px; }
+  nav a:hover { border-color:var(--accent); }
+  main { padding:24px 48px 64px; display:grid; gap:28px; }
+  section { background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,.01)); border:1px solid var(--border); border-radius:18px; padding:24px 28px; box-shadow:0 10px 40px rgba(0,0,0,.35); }
+  section h2 { margin:0 0 4px; font-size:21px; }
+  section .sub { color:var(--muted); margin:0 0 18px; font-size:14px; }
+  .mermaid { display:flex; justify-content:center; }
+  .legend { display:flex; gap:14px; flex-wrap:wrap; margin-top:14px; font-size:12px; color:var(--muted); }
+  .legend span::before { content:""; display:inline-block; width:12px; height:12px; border-radius:3px; margin-right:6px; vertical-align:-2px; background:var(--c); }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--border); }
+  th { color:var(--muted); font-weight:600; }
+  .pill { display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; font-weight:600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Northwind RAG &mdash; rag-guardrails</h1>
+  <p>LangGraph &middot; Hybrid retrieval (Chroma + BM25 + RRF) &middot; Cross-encoder rerank &middot; 7 guardrail layers &middot; Guarded streaming &middot; LangSmith evals</p>
+</header>
+<nav>
+  <a href="#pipeline">1. Pipeline</a>
+  <a href="#retrieval">2. Hybrid retrieval</a>
+  <a href="#guardrails">3. Guardrail layers</a>
+  <a href="#streaming">4. Guarded streaming</a>
+  <a href="#handoff">5. Live-agent handoff</a>
+  <a href="#deploy">6. Deployment</a>
+  <a href="#evals">7. Evals</a>
+</nav>
+<main>
+
+<section id="pipeline">
+  <h2>1. LangGraph request pipeline</h2>
+  <p class="sub">Input classification and retrieval run in parallel, so the LLM guard adds no latency. Every exit path ends with a refusal, a verified answer or a human handoff.</p>
+  <pre class="mermaid">
+flowchart LR
+  START((User question)):::start --> PREP["prepare<br/><small>validate · redact PII &amp; secrets</small>"]:::guard
+  PREP --> CI["classify_input<br/><small>regex → small LLM</small>"]:::guard
+  PREP --> RET["retrieve<br/><small>hybrid + rerank<br/>drop injected chunks<br/>mask secrets</small>"]:::retr
+  CI --> GATE{gate}:::gate
+  RET --> GATE
+  GATE -- "unsafe / injection" --> REF["refuse"]:::bad
+  GATE -- "user asked for human" --> HO["handoff<br/><small>live agent</small>"]:::human
+  GATE -- "no relevant chunks" --> NC["no_context"]:::warn
+  GATE -- "ok" --> GEN["generate<br/><small>streams tokens</small>"]:::llm
+  NC --> HO
+  GEN --> CHK["check_output<br/><small>citations · groundedness</small>"]:::guard
+  CHK -- "fail (1 retry)" --> GEN
+  CHK -- "verified" --> OK(("Answer ✓")):::ok
+  CHK -- "no answer / unverified" --> HO
+  REF --> END((END)):::start
+  HO --> END
+  OK --> END
+
+  classDef start fill:#1f2a4d,stroke:#7c9cff,color:#e6ebff,stroke-width:2px
+  classDef guard fill:#3b1d4a,stroke:#c38bff,color:#f3e8ff,stroke-width:2px
+  classDef retr fill:#0f3b3a,stroke:#3ddbc6,color:#dcfffa,stroke-width:2px
+  classDef llm fill:#14305e,stroke:#5aa2ff,color:#e3efff,stroke-width:2px
+  classDef gate fill:#4a3b0f,stroke:#ffcc4d,color:#fff6d6,stroke-width:2px
+  classDef bad fill:#4d1620,stroke:#ff6b81,color:#ffe3e8,stroke-width:2px
+  classDef warn fill:#4a2e12,stroke:#ffa04d,color:#fff0e0,stroke-width:2px
+  classDef human fill:#163d22,stroke:#5be07f,color:#e3ffe9,stroke-width:2px
+  classDef ok fill:#163d22,stroke:#5be07f,color:#e3ffe9,stroke-width:3px
+  </pre>
+  <div class="legend">
+    <span style="--c:#c38bff">Guardrail</span>
+    <span style="--c:#3ddbc6">Retrieval</span>
+    <span style="--c:#5aa2ff">LLM generation</span>
+    <span style="--c:#ffcc4d">Routing</span>
+    <span style="--c:#5be07f">Human / success</span>
+    <span style="--c:#ff6b81">Refusal</span>
+  </div>
+</section>
+
+<section id="retrieval">
+  <h2>2. Hybrid retrieval: recall, then precision</h2>
+  <p class="sub">Dense vectors match meaning; BM25 matches exact tokens (error strings, SKUs). RRF merges them by rank, then a cross-encoder rescores the top 20. Access control is applied <b>inside</b> both queries.</p>
+  <pre class="mermaid">
+flowchart LR
+  Q(["question<br/>+ user groups from JWT"]):::start
+  subgraph RECALL["Stage 1: Recall (parallel)"]
+    direction TB
+    D["Chroma<br/><small>embeddings · cosine ≥ threshold<br/>ACL filter</small>"]:::retr
+    L["Elasticsearch BM25<br/><small>minimum_should_match 2&lt;60%<br/>ACL filter</small>"]:::retr
+  end
+  Q --> D
+  Q --> L
+  D -- "ranked list A" --> RRF["Reciprocal Rank Fusion<br/><small>Σ w / (60 + rank)</small>"]:::gate
+  L -- "ranked list B" --> RRF
+  RRF --> T20["top 20 candidates"]:::llm
+  subgraph PREC["Stage 2: Precision"]
+    direction TB
+    CE["Cross-encoder<br/><small>reads question + chunk together<br/>local MiniLM / TEI bge-reranker</small>"]:::guard
+    DROP["drop score &lt; 0.05"]:::bad
+    CAP["max 2 chunks per file"]:::warn
+    TOP["top-k = 4"]:::ok
+    CE --> DROP --> CAP --> TOP
+  end
+  T20 --> CE
+  TOP --> CTX(["context for LLM"]):::start
+  L -. "ES down → dense only" .-> RRF
+  CE -. "error / &gt;2s → RRF order" .-> CAP
+
+  classDef start fill:#1f2a4d,stroke:#7c9cff,color:#e6ebff,stroke-width:2px
+  classDef guard fill:#3b1d4a,stroke:#c38bff,color:#f3e8ff,stroke-width:2px
+  classDef retr fill:#0f3b3a,stroke:#3ddbc6,color:#dcfffa,stroke-width:2px
+  classDef llm fill:#14305e,stroke:#5aa2ff,color:#e3efff,stroke-width:2px
+  classDef gate fill:#4a3b0f,stroke:#ffcc4d,color:#fff6d6,stroke-width:2px
+  classDef bad fill:#4d1620,stroke:#ff6b81,color:#ffe3e8,stroke-width:2px
+  classDef warn fill:#4a2e12,stroke:#ffa04d,color:#fff0e0,stroke-width:2px
+  classDef ok fill:#163d22,stroke:#5be07f,color:#e3ffe9,stroke-width:2px
+  </pre>
+</section>
+
+<section id="guardrails">
+  <h2>3. Seven guardrail layers: defence in depth</h2>
+  <p class="sub">Each layer catches what the previous ones can't. All of them fail closed.</p>
+  <pre class="mermaid">
+flowchart LR
+  U(["User input"]):::start --> G1["① Validation +<br/>PII/secret redaction<br/><small>regex · Luhn · ~0 ms</small>"]:::g1
+  G1 --> G2["② Prompt-injection<br/>heuristics<br/><small>regex · ~0 ms</small>"]:::g2
+  G2 --> G3["③ LLM input<br/>classifier<br/><small>parallel to retrieval</small>"]:::g3
+  G3 --> G4["④ Chunk screening<br/>+ secret masking<br/><small>poisoned docs</small>"]:::g4
+  G4 --> LLM{{"LLM generates"}}:::llm
+  LLM --> G5["⑤ Streaming redaction<br/>hold-back buffer<br/><small>≤128 chars delay</small>"]:::g5
+  G5 --> G6["⑥ Streaming moderation<br/>+ retraction<br/><small>async, non-blocking</small>"]:::g6
+  G6 --> G7["⑦ End-of-stream checks<br/>+ corrective retry<br/><small>citations · grounding</small>"]:::g7
+  G7 --> OUT(["Verified answer"]):::ok
+
+  classDef start fill:#1f2a4d,stroke:#7c9cff,color:#e6ebff,stroke-width:2px
+  classDef llm fill:#14305e,stroke:#5aa2ff,color:#e3efff,stroke-width:2px
+  classDef ok fill:#163d22,stroke:#5be07f,color:#e3ffe9,stroke-width:3px
+  classDef g1 fill:#2a1a4a,stroke:#9b7bff,color:#efe8ff,stroke-width:2px
+  classDef g2 fill:#321a4a,stroke:#b07bff,color:#efe8ff,stroke-width:2px
+  classDef g3 fill:#3b1a4a,stroke:#c37bff,color:#f6e8ff,stroke-width:2px
+  classDef g4 fill:#0f3b3a,stroke:#3ddbc6,color:#dcfffa,stroke-width:2px
+  classDef g5 fill:#4a1a3b,stroke:#ff7bc8,color:#ffe8f6,stroke-width:2px
+  classDef g6 fill:#4a1a2e,stroke:#ff7b9c,color:#ffe8ee,stroke-width:2px
+  classDef g7 fill:#4a1a1f,stroke:#ff7b7b,color:#ffe8e8,stroke-width:2px
+  </pre>
+  <table style="margin-top:18px">
+    <tr><th>#</th><th>Where</th><th>Catches</th></tr>
+    <tr><td>1</td><td>prepare</td><td>Emails, cards, IBANs, phones, API keys, before any LLM, embedding or log sees them</td></tr>
+    <tr><td>2</td><td>classify_input</td><td>"ignore previous instructions", role tags, "developer mode"</td></tr>
+    <tr><td>3</td><td>classify_input</td><td>Paraphrased injections, harmful requests, off-topic, agent requests</td></tr>
+    <tr><td>4</td><td>retrieve</td><td>Indirect injection in wiki pages; leaked keys in documents</td></tr>
+    <tr><td>5</td><td>API stream</td><td>Secrets/PII split across tokens (property-tested with 200 random chunkings)</td></tr>
+    <tr><td>6</td><td>API stream</td><td>Credential phishing, security bypass; stops generation to save tokens</td></tr>
+    <tr><td>7</td><td>check_output</td><td>Invalid or missing citations, ungrounded claims</td></tr>
+  </table>
+</section>
+
+<section id="streaming">
+  <h2>4. Guarded streaming (SSE <code>/chat/stream</code>)</h2>
+  <p class="sub">Text streams optimistically. Redaction holds back a small buffer, moderation runs in the background, and verification happens at the end. Anything already shown can be retracted.</p>
+  <pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant C as Client UI
+  participant API as FastAPI /chat/stream
+  participant G as LangGraph
+  participant R as Redactor ⑤
+  participant M as Moderator ⑥
+  participant V as check_output ⑦
+
+  C->>API: POST question (message_id)
+  API->>G: run graph
+  API-->>C: status {stage: retrieving}
+  loop each token
+    G->>R: token
+    R->>R: buffer, release len - holdback (never splits a match)
+    R-->>C: delta {text}
+    R-)M: every 240 chars (max 1 check in flight)
+  end
+  alt moderation flags text
+    M-->>C: retract {reason, replacement}
+    API->>G: close run (stop paying for tokens)
+  else stream finished
+    G->>V: full answer
+    alt citations + grounding OK
+      V-->>C: verified {citations, grounding_score}
+    else failed once
+      V-->>C: retract + regenerated answer (1 retry)
+    else failed twice
+      V-->>C: retract + handoff {ticket_id}
+    end
+  end
+  API-->>C: done {run summary}
+  </pre>
+</section>
+
+<section id="handoff">
+  <h2>5. Live-agent handoff across pods (WebSocket + Redis Streams)</h2>
+  <p class="sub">The desk webhook can land on any pod. Each conversation has a Redis Stream, and one shared reader per pod fans entries out to local sockets. Reconnecting clients resume from their last event ID.</p>
+  <pre class="mermaid">
+flowchart LR
+  DESK["Support desk<br/><small>ServiceNow / Zendesk / stub</small>"]:::human
+  subgraph PB["Pod B"]
+    WH["/agent/webhook<br/><small>idempotent by event_id</small>"]:::llm
+  end
+  subgraph RS["Redis"]
+    S[("stream<br/>conv:&lt;id&gt;:events<br/><small>MAXLEN~500 · 24h TTL</small>")]:::retr
+    OWN[("owner key<br/><small>atomic Lua claim</small>")]:::gate
+  end
+  subgraph PA["Pod A"]
+    RD["ONE shared reader<br/><small>XREAD BLOCK on all convs</small>"]:::guard
+    Q1["socket queue"]:::warn
+    Q2["socket queue"]:::warn
+  end
+  PG[("PostgreSQL<br/>history<br/><small>redacted only</small>")]:::start
+  U1(["User tab 1"]):::start
+  U2(["User tab 2"]):::start
+
+  DESK -- reply --> WH
+  WH -- "1. persist" --> PG
+  WH -- "2. XADD" --> S
+  S --> RD
+  RD --> Q1 -- WebSocket --> U1
+  RD --> Q2 -- WebSocket --> U2
+  U1 -- "user_message (PII-redacted)" --> DESK
+  U1 -. "ws-ticket (single-use, 30s)" .-> OWN
+
+  classDef start fill:#1f2a4d,stroke:#7c9cff,color:#e6ebff,stroke-width:2px
+  classDef guard fill:#3b1d4a,stroke:#c38bff,color:#f3e8ff,stroke-width:2px
+  classDef retr fill:#0f3b3a,stroke:#3ddbc6,color:#dcfffa,stroke-width:2px
+  classDef llm fill:#14305e,stroke:#5aa2ff,color:#e3efff,stroke-width:2px
+  classDef gate fill:#4a3b0f,stroke:#ffcc4d,color:#fff6d6,stroke-width:2px
+  classDef warn fill:#4a2e12,stroke:#ffa04d,color:#fff0e0,stroke-width:2px
+  classDef human fill:#163d22,stroke:#5be07f,color:#e3ffe9,stroke-width:2px
+  </pre>
+</section>
+
+<section id="deploy">
+  <h2>6. Kubernetes deployment</h2>
+  <p class="sub">Istio verifies the JWT and injects <code>X-User-Id</code> and groups. NetworkPolicy denies by default. Ingest runs as a Job, never inside API pods.</p>
+  <pre class="mermaid">
+flowchart TB
+  USER(["Browser / client"]):::start --> GW
+  subgraph MESH["Istio mesh (mTLS STRICT)"]
+    GW["Istio Gateway<br/><small>JWT → X-User-Id + X-Jwt-Payload<br/>strip identity headers<br/>no POST retries</small>"]:::gate
+    subgraph APIS["rag-api Deployment (3+ · HPA · PDB)"]
+      A1["api pod"]:::llm
+      A2["api pod"]:::llm
+      A3["api pod"]:::llm
+    end
+    GW --> APIS
+    REDIS[("Redis<br/><small>limiter leases<br/>conversation streams</small>")]:::retr
+    CHROMA[("Chroma<br/>StatefulSet + PVC")]:::retr
+    ES[("Elasticsearch<br/>BM25")]:::retr
+    RER["Reranker TEI<br/><small>bge-reranker-base · 2 replicas</small>"]:::guard
+    PGS[("PostgreSQL<br/>StatefulSet + PVC")]:::start
+    APIS --> REDIS
+    APIS --> CHROMA
+    APIS --> ES
+    APIS --> RER
+    APIS --> PGS
+    subgraph JOBS["Jobs / CronJobs"]
+      ING["ingest Job<br/><small>per deploy + nightly</small>"]:::warn
+      MIG["migrate Job<br/><small>before rollout</small>"]:::warn
+      PUR["purge + sweep<br/>CronJobs"]:::warn
+    end
+    ING --> CHROMA
+    ING --> ES
+    MIG --> PGS
+    PUR --> PGS
+  end
+  LLMP{{"LLM provider<br/><small>OpenAI / Anthropic / Azure</small>"}}:::bad
+  LS{{"LangSmith<br/><small>traces · experiments</small>"}}:::human
+  APIS --> LLMP
+  APIS -.-> LS
+
+  classDef start fill:#1f2a4d,stroke:#7c9cff,color:#e6ebff,stroke-width:2px
+  classDef guard fill:#3b1d4a,stroke:#c38bff,color:#f3e8ff,stroke-width:2px
+  classDef retr fill:#0f3b3a,stroke:#3ddbc6,color:#dcfffa,stroke-width:2px
+  classDef llm fill:#14305e,stroke:#5aa2ff,color:#e3efff,stroke-width:2px
+  classDef gate fill:#4a3b0f,stroke:#ffcc4d,color:#fff6d6,stroke-width:2px
+  classDef bad fill:#4d1620,stroke:#ff6b81,color:#ffe3e8,stroke-width:2px
+  classDef warn fill:#4a2e12,stroke:#ffa04d,color:#fff0e0,stroke-width:2px
+  classDef human fill:#163d22,stroke:#5be07f,color:#e3ffe9,stroke-width:2px
+  </pre>
+</section>
+
+<section id="evals">
+  <h2>7. Evaluation gates (CI + LangSmith)</h2>
+  <p class="sub">27 examples: golden Q&amp;A, unanswerable, off-topic, human requests, injections, harmful asks, a secret probe and PII. Security metrics are zero-tolerance.</p>
+  <table>
+    <tr><th>Metric</th><th>Type</th><th>Gate</th></tr>
+    <tr><td>behavior</td><td>deterministic</td><td><span class="pill" style="background:#14305e">≥ 0.90</span></td></tr>
+    <tr><td>retrieval_recall</td><td>deterministic</td><td><span class="pill" style="background:#14305e">≥ 0.85</span></td></tr>
+    <tr><td>retrieval_mrr</td><td>deterministic</td><td><span class="pill" style="background:#14305e">≥ 0.80</span></td></tr>
+    <tr><td>citation_validity</td><td>deterministic</td><td><span class="pill" style="background:#14305e">≥ 0.95</span></td></tr>
+    <tr><td>no_leak</td><td>deterministic</td><td><span class="pill" style="background:#4d1620">= 1.00</span></td></tr>
+    <tr><td>access_control</td><td>deterministic</td><td><span class="pill" style="background:#4d1620">= 1.00</span></td></tr>
+    <tr><td>handoff_routing</td><td>deterministic</td><td><span class="pill" style="background:#14305e">≥ 0.95</span></td></tr>
+    <tr><td>correctness</td><td>LLM judge</td><td><span class="pill" style="background:#3b1d4a">≥ 0.85</span></td></tr>
+    <tr><td>faithfulness</td><td>LLM judge</td><td><span class="pill" style="background:#3b1d4a">≥ 0.90</span></td></tr>
+    <tr><td>guard_precision / guard_recall</td><td>summary</td><td><span class="pill" style="background:#4d1620">≥ 0.95 / = 1.00</span></td></tr>
+  </table>
+</section>
+
+</main>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: "dark",
+    securityLevel: "strict",
+    flowchart: { curve: "basis", htmlLabels: true, padding: 14 },
+    themeVariables: {
+      fontFamily: "Segoe UI, system-ui, sans-serif",
+      fontSize: "14px",
+      background: "#131a2e",
+      lineColor: "#93a0c4",
+      clusterBkg: "#0f1529",
+      clusterBorder: "#3a4670",
+      actorBkg: "#1f2a4d", actorBorder: "#7c9cff", actorTextColor: "#e6ebff",
+      signalColor: "#c9d3f5", signalTextColor: "#e6ebff",
+      noteBkgColor: "#3b1d4a", noteTextColor: "#f3e8ff",
+      labelBoxBkgColor: "#1f2a4d", loopTextColor: "#e6ebff"
+    }
+  });
+</script>
+</body>
+</html>
