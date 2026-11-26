@@ -25,6 +25,7 @@ from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResu
 
 from northwind_rag.config import Settings
 from northwind_rag.limits import Limiter, LocalLimiter
+from northwind_rag.rerank import Reranker, build_reranker
 
 T = TypeVar("T")
 from northwind_rag.prompts import IDK_ANSWER
@@ -70,6 +71,7 @@ class ModelSuite:
     embeddings: Embeddings
     offline: bool
     policy: CallPolicy = field(default_factory=CallPolicy)
+    reranker: Reranker | None = None  # cross-encoder for the second retrieval stage
 
     async def call(self, role: Role, call: Callable[[], Awaitable[T]]) -> T:
         return await self.policy.run(role, call)
@@ -85,6 +87,7 @@ def build_suite(settings: Settings, limiter: Limiter | None = None) -> ModelSuit
             embeddings=HashingEmbeddings(),
             offline=True,
             policy=policy,
+            reranker=build_reranker(settings),
         )
 
     from langchain.chat_models import init_chat_model
@@ -97,6 +100,7 @@ def build_suite(settings: Settings, limiter: Limiter | None = None) -> ModelSuit
         embeddings=OpenAIEmbeddings(model=settings.embedding_model),
         offline=False,
         policy=policy,
+        reranker=build_reranker(settings),
     )
 
 

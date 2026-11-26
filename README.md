@@ -44,11 +44,13 @@ python -m evals.run_langsmith --prefix baseline
 Models are plain `init_chat_model` strings, so switching provider is a config change, for example
 `RAG_CHAT_MODEL=anthropic:claude-sonnet-4-5` or `azure_openai:<deployment>`.
 
-## Hybrid retrieval (dense + BM25 + Reciprocal Rank Fusion)
+## Hybrid retrieval (dense + BM25 + Reciprocal Rank Fusion + cross-encoder rerank)
 
 ```
 question ─┬─► Chroma (embeddings, cosine ≥ threshold) ─► ranked list A ─┐
-          └─► Elasticsearch BM25 (minimum_should_match) ─► ranked list B ─┴─► RRF ─► 2 per file ─► top-k
+          └─► Elasticsearch BM25 (minimum_should_match) ─► ranked list B ─┴─► RRF ─► top 20
+                                                                                    │
+     top-k ◄── 2 per file ◄── drop < rerank_min_score ◄── sort ◄── cross-encoder(question, chunk) ◄┘
 ```
 
 - **Why both.** Embeddings match meaning ("VPN keeps dropping" ≈ "disconnects every few
@@ -74,11 +76,34 @@ question ─┬─► Chroma (embeddings, cosine ≥ threshold) ─► ranked li
   `RAG_RETRIEVAL_MODE=dense` to turn hybrid off.
 - **Debugging.** Every retrieved chunk carries `dense_rank`, `lexical_rank`, `rrf_score`, the
   cosine `score` and `lexical_score`, which are visible in LangSmith traces.
+- **Reranking (stage 2).** The embedding model encodes the question and each chunk
+  *separately*, then compares two vectors. A cross-encoder reads the question and the chunk
+  *together* in one pass, so every question word attends to every chunk word. That is much more
+  precise, and too slow for the whole corpus, so it only rescores the top
+  `RAG_RERANK_CANDIDATES` (20) fused chunks, in one batch. Then:
+  - Chunks are sorted by the cross-encoder's relevance probability (sigmoid of its logit, 0..1
+    for every backend). Chunks below `RAG_RERANK_MIN_SCORE` (0.05) are dropped, so an off-topic
+    question can end with no context, which leads to "I don't know" or a handoff, instead of
+    the LLM getting weak context.
+  - The 2-chunks-per-file cap and `top_k` apply *after* reranking.
+  - Backends (`RAG_RERANKER`): `local` runs `cross-encoder/ms-marco-MiniLM-L-6-v2` in-process
+    with sentence-transformers (`pip install ".[rerank]"`; loaded at start-up, CPU work capped by
+    `RAG_RERANK_CONCURRENCY`). `http` calls a Text Embeddings Inference server's `/rerank`
+    (Docker Compose and Kubernetes run `BAAI/bge-reranker-base`, which is multilingual), keeping
+    torch out of the API image. `none` turns it off. Offline mode uses a deterministic
+    term-overlap stand-in with the same contract.
+  - **Degradation.** If the reranker errors, or takes longer than `RAG_RERANK_TIMEOUT_S` (2 s),
+    the RRF order is used and each chunk carries `reranked: false`. The chat never fails
+    because of the reranker.
+  - **Debugging.** Each chunk also carries `rerank_score`, `rerank_rank`, `rrf_rank` and
+    `reranker`, so a trace shows how far the cross-encoder moved it.
 - **Measuring it.** The `retrieval_mrr` metric and three exact-term examples were added to the
   eval set. Compare `RAG_RETRIEVAL_MODE=dense` against `hybrid`, or different RRF weights, as
   LangSmith experiments; the mode and weights are recorded as experiment metadata. Offline, both
   modes score the same, because the offline embedding is itself lexical. The difference only
-  shows with real embeddings.
+  shows with real embeddings. Compare `RAG_RERANKER=none` against `local` or `http` the same way
+  (the reranker, candidates and threshold are recorded too), and tune `RAG_RERANK_MIN_SCORE`
+  on the unanswerable and off-topic examples.
 
 ## Guardrail layers
 
@@ -294,12 +319,13 @@ k8s/base/                 kustomize base
   redis.yaml              limiter leases + conversation streams (no eviction policy)
   chroma.yaml             StatefulSet + PVC, HTTP server shared by all API pods
   elasticsearch.yaml      BM25 index, single node (ECK / Elastic Cloud + API key for production)
+  reranker.yaml           TEI cross-encoder (bge-reranker-base, CPU), 2 replicas + PDB; api→reranker only
   postgres.yaml           conversation history, StatefulSet + PVC (managed DB / CloudNativePG for prod)
   database-jobs.yaml      migrate Job (before each rollout) + nightly history purge CronJob
                           + every-minute sweep of questions stuck in 'processing'
   api.yaml                Deployment (3+), probes, preStop drain, HPA, PDB, topology spread
   ingest.yaml             Job per deploy + nightly CronJob re-sync (idempotent upserts)
-  networkpolicy.yaml      default deny; gateway→api, api→redis, api/ingest→chroma and elasticsearch,
+  networkpolicy.yaml      default deny; gateway→api, api→redis, api→reranker, api/ingest→chroma and elasticsearch,
                           db-client pods (api, migrate, purge, sweep)→postgres
   istio.yaml              Gateway, VirtualService (SSE/WebSocket timeouts, no POST retries), mTLS STRICT,
                           JWT → X-User-Id, AuthorizationPolicy
@@ -387,6 +413,7 @@ src/northwind_rag/
   store.py             KnowledgeBase: ingest into Chroma + lexical index, hybrid search with RRF
   lexical.py           Elasticsearch BM25 index / in-process BM25 (same minimum_should_match rule)
   fusion.py            Reciprocal Rank Fusion
+  rerank.py            cross-encoder reranking: local sentence-transformers / TEI over HTTP / offline stand-in
   graph.py             LangGraph pipeline
   pipeline.py          Pipeline + guarded streaming loop (SSE events)
   api.py               FastAPI: /chat, /chat/stream, /handoff, /conversations (list),

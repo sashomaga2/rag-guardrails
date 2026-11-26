@@ -69,6 +69,9 @@ async def main(prefix: str, reps: int, concurrency: int, recreate: bool) -> None
             "lexical_backend": "elasticsearch" if s.elasticsearch_url else "local_bm25",
             "rrf_k": s.rrf_k,
             "rrf_weights": f"{s.rrf_dense_weight}/{s.rrf_lexical_weight}",
+            "reranker": s.reranker if s.reranker == "none" else f"{s.reranker}:{s.reranker_model}",
+            "rerank_candidates": s.rerank_candidates,
+            "rerank_min_score": s.rerank_min_score,
         },
     )
     print(f"\nExperiment: {results.experiment_name}")

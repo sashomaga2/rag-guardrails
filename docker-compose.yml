@@ -9,6 +9,9 @@ x-app-env: &app-env
   RAG_CHROMA_PORT: "8000"
   RAG_RETRIEVAL_MODE: hybrid
   RAG_ELASTICSEARCH_URL: http://elasticsearch:9200
+  RAG_RERANKER: http
+  RAG_RERANKER_URL: http://reranker:80
+  RAG_RERANKER_MODEL: BAAI/bge-reranker-base
   RAG_DATABASE_URL: postgresql://northwind:northwind@postgres:5432/northwind
   RAG_AUTO_INGEST: "false"
   OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -47,6 +50,12 @@ services:
       interval: 10s
       timeout: 10s
       retries: 30
+
+  reranker:  # cross-encoder over the fused candidates; first start downloads the model (~1 GB)
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+    command: ["--model-id", "BAAI/bge-reranker-base", "--auto-truncate"]
+    volumes:
+      - tei-data:/data
 
   postgres:
     image: postgres:16-alpine
@@ -93,6 +102,8 @@ services:
         condition: service_completed_successfully
       migrate:
         condition: service_completed_successfully
+      reranker:
+        condition: service_started  # until it's up, answers use the RRF order (logged)
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/readyz', timeout=3)"]
       interval: 10s
@@ -104,3 +115,4 @@ volumes:
   chroma-data:
   es-data:
   pg-data:
+  tei-data:

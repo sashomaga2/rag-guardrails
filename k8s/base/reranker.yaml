@@ -1,0 +1,88 @@
+# Cross-encoder reranker: Hugging Face Text Embeddings Inference (TEI) serving BAAI/bge-reranker-base
+# on CPU. The API calls POST /rerank (RAG_RERANKER=http) with the ~20 fused candidates per question.
+# A separate Deployment keeps torch and the model out of the API image, and lets the reranker scale
+# (and later move to a GPU node pool: image text-embeddings-inference:1.9) independently.
+# Stateless: the model is downloaded from the Hugging Face Hub into an emptyDir on start. For air-gapped
+# clusters, bake it into an image or mount a PVC at /data and pass --model-id /data/<dir>.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reranker
+  labels: {app: reranker}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: reranker}
+  template:
+    metadata:
+      labels: {app: reranker}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {app: reranker}
+      containers:
+        - name: tei
+          image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9  # pin a digest in prod
+          args:
+            - --model-id=BAAI/bge-reranker-base  # multilingual (XLM-RoBERTa); bge-reranker-v2-m3 for more quality
+            - --port=8080  # non-root: no privileged port
+            - --auto-truncate  # long chunks are cut at the model's max length instead of erroring
+            - --max-client-batch-size=64
+          env:
+            - {name: HUGGINGFACE_HUB_CACHE, value: /data}
+          ports:
+            - {name: http, containerPort: 8080}
+          startupProbe:  # first start downloads ~1 GB of weights
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            requests: {cpu: "1", memory: 1536Mi}
+            limits: {memory: 3Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: model-cache, mountPath: /data}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: model-cache
+          emptyDir: {sizeLimit: 4Gi}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: reranker
+  labels: {app: reranker}
+spec:
+  selector: {app: reranker}
+  ports:
+    - {name: http, port: 80, targetPort: http}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: reranker
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: reranker}

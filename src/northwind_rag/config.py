@@ -54,6 +54,17 @@ class Settings(BaseSettings):
     rrf_dense_weight: float = 1.0
     rrf_lexical_weight: float = 1.0
 
+    # --- Reranking (cross-encoder over the fused candidates; see rerank.py) ---------
+    reranker: Literal["local", "http", "none"] = "local"  # offline mode always uses the overlap stand-in
+    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"  # fast on CPU; BAAI/bge-reranker-v2-m3 for multilingual
+    reranker_url: str | None = None  # http: Text Embeddings Inference server, e.g. http://reranker:80
+    rerank_candidates: int = 20  # fused chunks sent to the cross-encoder (recall stage size)
+    rerank_min_score: float = 0.05  # relevance probability; below it a chunk is dropped (tune with evals)
+    offline_rerank_min_score: float = 0.2  # the overlap stand-in scores on a different scale
+    rerank_timeout_s: float = 2.0  # slower than this -> keep the RRF order instead
+    rerank_max_length: int = 512  # tokens per (question, chunk) pair
+    rerank_concurrency: int = 2  # concurrent local inference batches per process (CPU-bound)
+
     # --- Guardrails ---------------------------------------------------------
     max_question_chars: int = 2000
     max_generation_attempts: int = 2  # 1 retry when groundedness check fails
@@ -98,6 +109,10 @@ class Settings(BaseSettings):
     def relevance_threshold(self) -> float:
         return self.offline_min_relevance if self.offline else self.min_relevance
 
+    @property
+    def rerank_threshold(self) -> float:
+        return self.offline_rerank_min_score if self.offline else self.rerank_min_score
+
     @model_validator(mode="after")
     def _check_holdback(self) -> "Settings":
         from northwind_rag.guardrails.patterns import MAX_MATCH_CHARS
@@ -107,6 +122,8 @@ class Settings(BaseSettings):
                 f"stream_holdback_chars ({self.stream_holdback_chars}) must be >= "
                 f"MAX_MATCH_CHARS ({MAX_MATCH_CHARS}) or split secrets can leak"
             )
+        if self.reranker != "none" and self.rerank_candidates < self.top_k:
+            raise ValueError(f"rerank_candidates ({self.rerank_candidates}) must be >= top_k ({self.top_k})")
         if self.turn_stale_after_s < 3 * self.turn_heartbeat_s:
             raise ValueError(
                 f"turn_stale_after_s ({self.turn_stale_after_s}) must be >= 3 x turn_heartbeat_s "

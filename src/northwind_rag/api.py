@@ -71,6 +71,8 @@ class HandoffBody(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.pipeline = Pipeline.create()
+    if (reranker := app.state.pipeline.kb.reranker) is not None:
+        await reranker.warm_up()  # load the cross-encoder before the pod reports ready
     yield
     # Graceful shutdown: uvicorn has already drained in-flight requests; anything still marked
     # 'processing' by this worker is failed now, so a retry doesn't wait for the sweep CronJob.

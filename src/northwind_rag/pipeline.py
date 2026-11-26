@@ -53,7 +53,7 @@ class Pipeline:
         bus = bus or build_bus(settings.redis_url, settings.conversation_ttl_s)
         history = history or build_history(settings.database_url, settings.db_pool_min, settings.db_pool_max)
         suite = build_suite(settings, limiter)
-        kb = KnowledgeBase(settings, suite.embeddings, persist_directory)
+        kb = KnowledgeBase(settings, suite.embeddings, persist_directory, reranker=suite.reranker)
         if settings.auto_ingest and kb.count() == 0:
             log.info("empty collection; ingesting %s", settings.docs_dir)
             kb.ingest()

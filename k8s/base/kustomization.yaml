@@ -9,6 +9,7 @@ resources:
   - redis.yaml
   - chroma.yaml
   - elasticsearch.yaml
+  - reranker.yaml
   - postgres.yaml
   - database-jobs.yaml
   - api.yaml

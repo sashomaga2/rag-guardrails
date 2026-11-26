@@ -1,8 +1,9 @@
-"""Knowledge base: Chroma (dense) + a lexical index (Elasticsearch / local BM25), fused with RRF.
+"""Knowledge base: Chroma (dense) + a lexical index (Elasticsearch / local BM25), fused with RRF,
+then reranked by a cross-encoder (see rerank.py).
 
 Ingestion writes the same chunk ids to both stores and removes stale chunks from both.
 Retrieval runs both searches in parallel; if the lexical side fails, it degrades to dense-only
-instead of failing the chat.
+instead of failing the chat. If the reranker fails or is slow, the RRF order is kept.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharac
 from northwind_rag.config import Settings
 from northwind_rag.fusion import rrf_merge
 from northwind_rag.lexical import ElasticsearchIndex, LexicalIndex, LocalBM25Index
+from northwind_rag.rerank import Reranker
 
 log = logging.getLogger(__name__)
 _PLACEHOLDER_RE = re.compile(r"\[REDACTED:[a-z_]+\]")
@@ -37,8 +39,9 @@ class IngestReport:
 
 class KnowledgeBase:
     def __init__(self, settings: Settings, embeddings: Embeddings, persist_directory: Path | None = None,
-                 lexical: LexicalIndex | None = None):
+                 lexical: LexicalIndex | None = None, reranker: Reranker | None = None):
         self.settings = settings
+        self.reranker = reranker
         location = (
             {"host": settings.chroma_host, "port": settings.chroma_port}  # Chroma server (Kubernetes)
             if settings.chroma_host and persist_directory is None
@@ -134,8 +137,10 @@ class KnowledgeBase:
 
     # -- retrieval ------------------------------------------------------------
     async def search(self, query: str) -> list[Document]:
-        """Hybrid: dense (above the relevance threshold) + lexical (minimum_should_match),
-        fused with RRF, at most N chunks per source file, top-k."""
+        """Stage 1 (recall): dense (above the relevance threshold) + lexical (minimum_should_match),
+        fused with RRF. Stage 2 (precision): the cross-encoder rescores the top
+        `rerank_candidates`, drops those below `rerank_min_score` and re-orders the rest.
+        Finally at most N chunks per source file, top-k."""
         s = self.settings
         query = _PLACEHOLDER_RE.sub(" ", query)  # "[REDACTED:email]" carries no meaning for retrieval
         dense_task = self.vs.asimilarity_search_with_relevance_scores(query, k=s.fetch_k)
@@ -160,28 +165,61 @@ class KnowledgeBase:
             k=s.rrf_k,
             weights={"dense": s.rrf_dense_weight, "lexical": s.rrf_lexical_weight},
         )
-
-        results: list[Document] = []
-        per_source: dict[str, int] = {}
-        for f in fused:
+        candidates: list[Document] = []
+        for rank, f in enumerate(fused, start=1):
             doc: Document = f.item
-            src = doc.metadata.get("source", "")
-            if per_source.get(src, 0) >= s.max_chunks_per_source:
-                continue
-            per_source[src] = per_source.get(src, 0) + 1
             cid = doc.metadata["chunk_id"]
             doc.metadata.update(
                 retrieval=mode,
                 rrf_score=round(f.score, 5),
+                rrf_rank=rank,
                 dense_rank=f.ranks.get("dense"),
                 lexical_rank=f.ranks.get("lexical"),
                 score=round(float(dense_score[cid]), 4) if cid in dense_score else None,
                 lexical_score=round(float(lexical_score[cid]), 3) if cid in lexical_score else None,
             )
+            candidates.append(doc)
+
+        candidates, reranked = await self._rerank(query, candidates)
+
+        results: list[Document] = []
+        per_source: dict[str, int] = {}
+        for doc in candidates:
+            src = doc.metadata.get("source", "")
+            if per_source.get(src, 0) >= s.max_chunks_per_source:
+                continue
+            per_source[src] = per_source.get(src, 0) + 1
+            doc.metadata["reranked"] = reranked
             results.append(doc)
             if len(results) == s.top_k:
                 break
         return results
+
+    async def _rerank(self, query: str, candidates: list[Document]) -> tuple[list[Document], bool]:
+        """Cross-encoder over the top RRF candidates. Returns (new order, reranked?). Chunks below
+        the threshold are dropped, so an off-topic question can end with no context at all."""
+        s = self.settings
+        if self.reranker is None or not candidates:
+            return candidates, False
+        pool = candidates[: s.rerank_candidates]
+        try:
+            async with asyncio.timeout(s.rerank_timeout_s):
+                scores = await self.reranker.score(query, [d.page_content for d in pool])
+        except Exception:  # incl. TimeoutError: degrade to the RRF order, don't fail the chat
+            log.warning("reranker %s failed; keeping RRF order", self.reranker.name, exc_info=True)
+            return candidates, False
+        if len(scores) != len(pool):
+            log.warning("reranker %s returned %d scores for %d chunks; keeping RRF order",
+                        self.reranker.name, len(scores), len(pool))
+            return candidates, False
+        order = sorted(range(len(pool)), key=lambda i: (-scores[i], i))  # ties keep the RRF order
+        kept = []
+        for position, i in enumerate(order, start=1):
+            doc = pool[i]
+            doc.metadata.update(rerank_score=round(scores[i], 4), rerank_rank=position, reranker=self.reranker.name)
+            if scores[i] >= s.rerank_threshold:
+                kept.append(doc)
+        return kept, True
 
     async def ready(self) -> bool:
         return self.lexical is None or await self.lexical.ping()

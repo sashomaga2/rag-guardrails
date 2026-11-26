@@ -87,3 +87,18 @@ spec:
             matchLabels: {app: rag-ingest}
       ports:
         - {port: 8000, protocol: TCP}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: reranker-from-api
+spec:
+  podSelector:
+    matchLabels: {app: reranker}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: rag-api}
+      ports:
+        - {port: 8080, protocol: TCP}

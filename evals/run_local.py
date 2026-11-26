@@ -74,7 +74,8 @@ async def run(concurrency: int) -> int:
     latencies = sorted(l for *_, l in rows)
 
     s = pipeline.settings
-    print(f"\nSummary  [retrieval={s.retrieval_mode}, rrf_k={s.rrf_k}]"
+    reranker = pipeline.kb.reranker.name if pipeline.kb.reranker else "none"
+    print(f"\nSummary  [retrieval={s.retrieval_mode}, rrf_k={s.rrf_k}, reranker={reranker}]"
           + (f"  ({skipped} example(s) needing the LLM guard skipped in offline mode)" if skipped else ""))
     failed = False
     for key, values in totals.items():
