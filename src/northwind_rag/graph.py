@@ -60,6 +60,7 @@ class RAGState(TypedDict, total=False):
     question: str
     conversation_id: str | None
     user_id: str | None
+    user_groups: list[str]  # from the verified JWT; retrieval only sees documents these may read
     # guardrail results
     sanitized_question: str
     input_valid: bool
@@ -128,7 +129,7 @@ def build_graph(
         if not state["input_valid"]:
             return {"documents": [], "dropped_documents": []}
         stage("retrieving")
-        docs = await kb.search(state["sanitized_question"])
+        docs = await kb.search(state["sanitized_question"], groups=frozenset(state.get("user_groups") or ()))
         screened = screen_documents(docs)
         return {"documents": screened.kept, "dropped_documents": screened.dropped}
 

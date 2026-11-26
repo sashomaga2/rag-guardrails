@@ -7,7 +7,7 @@ import logging
 from contextlib import aclosing
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Iterable
 
 from northwind_rag.config import Settings, get_settings
 from northwind_rag.graph import RAGState, build_graph, summarize
@@ -57,6 +57,9 @@ class Pipeline:
         if settings.auto_ingest and kb.count() == 0:
             log.info("empty collection; ingesting %s", settings.docs_dir)
             kb.ingest()
+        if (unlabelled := kb.unlabelled_sample()) > 0:
+            log.warning("%d indexed chunk(s) have no access label and are hidden from everyone: "
+                        "run `python -m northwind_rag.cli ingest` to re-index", unlabelled)
         graph = build_graph(suite, kb, settings, live_agent, bus)
         return cls(settings, suite, kb, graph, live_agent, limiter, bus, history)
 
@@ -85,17 +88,23 @@ class Pipeline:
         return checks
 
     @staticmethod
-    def _inputs(question: str, conversation_id: str | None, user_id: str | None) -> RAGState:
-        return {"question": question, "conversation_id": conversation_id, "user_id": user_id}
+    def _inputs(question: str, conversation_id: str | None, user_id: str | None,
+                groups: Iterable[str] | None) -> RAGState:
+        return {"question": question, "conversation_id": conversation_id, "user_id": user_id,
+                "user_groups": sorted(set(groups or ()))}
 
     async def ask(
-        self, question: str, conversation_id: str | None = None, user_id: str | None = None, **config: Any
+        self, question: str, conversation_id: str | None = None, user_id: str | None = None,
+        groups: Iterable[str] | None = None, **config: Any
     ) -> dict[str, Any]:
-        state: RAGState = await self.graph.ainvoke(self._inputs(question, conversation_id, user_id), config=config or None)
+        """`groups`: the user's groups from the verified token. None/empty -> public documents only."""
+        state: RAGState = await self.graph.ainvoke(self._inputs(question, conversation_id, user_id, groups),
+                                                   config=config or None)
         return summarize(state)
 
     async def stream(
-        self, question: str, conversation_id: str | None = None, user_id: str | None = None, **config: Any
+        self, question: str, conversation_id: str | None = None, user_id: str | None = None,
+        groups: Iterable[str] | None = None, **config: Any
     ) -> AsyncIterator[dict[str, Any]]:
         """Run the graph and yield client events with streaming guardrails applied.
 
@@ -120,7 +129,7 @@ class Pipeline:
             return {"event": "retract", "data": {"reason": f"moderation:{category}", "replacement": MODERATION_REPLACEMENT}}
 
         stream = self.graph.astream(
-            self._inputs(question, conversation_id, user_id), stream_mode=["messages", "updates", "custom"], config=config or None
+            self._inputs(question, conversation_id, user_id, groups), stream_mode=["messages", "updates", "custom"], config=config or None
         )
         streamed_any = False
         try:

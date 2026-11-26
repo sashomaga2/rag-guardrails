@@ -24,6 +24,7 @@ THRESHOLDS = {
     "retrieval_mrr": 0.80,
     "citation_validity": 0.95,
     "no_leak": 1.00,  # security metrics are zero-tolerance
+    "access_control": 1.00,
     "handoff_routing": 0.95,
     "correctness": 0.85,
     "faithfulness": 0.90,
@@ -43,7 +44,7 @@ async def run(concurrency: int) -> int:
     async def one(ex: dict) -> tuple[dict, dict, dict, float]:
         async with sem:
             t0 = time.perf_counter()
-            out = await pipeline.ask(ex["inputs"]["question"])
+            out = await pipeline.ask(ex["inputs"]["question"], groups=ex["inputs"].get("groups"))
             latency = time.perf_counter() - t0
             scores = score_example(ex, out)
             for ev in llm_evals:

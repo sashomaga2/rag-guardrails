@@ -6,6 +6,8 @@ Run:  uvicorn northwind_rag.api:app --reload
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import hashlib
 import hmac
@@ -25,6 +27,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 
+from northwind_rag.access import parse_groups
 from northwind_rag.guardrails.input import prepare_input
 from northwind_rag.handoff import HandoffRequest
 from northwind_rag.history import TurnClaim
@@ -99,6 +102,25 @@ def _busy(retry_after_s: int = 2, code: str = "busy") -> JSONResponse:
 # In production the user id comes from the verified JWT: Istio RequestAuthentication copies the
 # "sub" claim into this header (see k8s/istio.yaml), and the mesh strips it from client requests.
 UserId = Header(default=None, alias="X-User-Id", max_length=128)
+# Istio forwards the payload of the token it just verified (outputPayloadToHeader); the gateway
+# strips any client-supplied copy first (k8s/istio.yaml). Its groups claim decides which documents
+# retrieval may read. No header / no claim -> public documents only.
+JwtPayload = Header(default=None, alias="X-Jwt-Payload", max_length=16384)
+
+
+def user_groups(jwt_payload: str | None, claim: str = "groups") -> frozenset[str]:
+    """base64url(JSON) -> the groups claim, as a list or a space/comma separated string.
+    Anything malformed yields no groups: it can only ever narrow access, never widen it."""
+    if not jwt_payload:
+        return frozenset()
+    try:
+        raw = base64.urlsafe_b64decode(jwt_payload + "=" * (-len(jwt_payload) % 4))
+        claims = json.loads(raw)
+        value = claims.get(claim) if isinstance(claims, dict) else None
+        return parse_groups(value if isinstance(value, (str, list)) else None, strict=False)
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        log.warning("ignoring malformed X-Jwt-Payload header")
+        return frozenset()
 
 
 def _sse(event: str, data: dict) -> str:
@@ -306,8 +328,10 @@ async def _agent_owned(p: Pipeline, conversation_id: str | None) -> bool:
 
 
 @app.post("/chat")
-async def chat(body: ChatRequest, request: Request, user_id: str | None = UserId):
+async def chat(body: ChatRequest, request: Request, user_id: str | None = UserId,
+               jwt_payload: str | None = JwtPayload):
     p: Pipeline = request.app.state.pipeline
+    groups = user_groups(jwt_payload, p.settings.groups_claim)
     user_id = await authorize_conversation(p, body.conversation_id, user_id)
     if await _agent_owned(p, body.conversation_id):
         return await forward_to_agent(p, body.conversation_id, body.question, body.message_id)
@@ -322,7 +346,8 @@ async def chat(body: ChatRequest, request: Request, user_id: str | None = UserId
                 turn.start()
             try:
                 result = await p.ask(
-                    body.question, conversation_id=body.conversation_id, user_id=user_id, run_name="chat", tags=["api"]
+                    body.question, conversation_id=body.conversation_id, user_id=user_id, groups=groups,
+                    run_name="chat", tags=["api"]
                 )
             except BaseException as exc:  # incl. cancellation (client left): free it for a retry now
                 if turn is not None:
@@ -338,8 +363,10 @@ async def chat(body: ChatRequest, request: Request, user_id: str | None = UserId
 
 
 @app.post("/chat/stream")
-async def chat_stream(body: ChatRequest, request: Request, user_id: str | None = UserId):
+async def chat_stream(body: ChatRequest, request: Request, user_id: str | None = UserId,
+                      jwt_payload: str | None = JwtPayload):
     p: Pipeline = request.app.state.pipeline
+    groups = user_groups(jwt_payload, p.settings.groups_claim)
     user_id = await authorize_conversation(p, body.conversation_id, user_id)
     if await _agent_owned(p, body.conversation_id):
         forwarded = await forward_to_agent(p, body.conversation_id, body.question, body.message_id)
@@ -376,6 +403,7 @@ async def chat_stream(body: ChatRequest, request: Request, user_id: str | None =
                 body.question,
                 conversation_id=body.conversation_id,
                 user_id=user_id,
+                groups=groups,
                 run_name="chat_stream",
                 tags=["api", "stream"],
             ):

@@ -102,6 +102,7 @@ class Settings(BaseSettings):
     handoff_on_no_answer: bool = True  # KB has no answer -> forward to a human
     handoff_on_unverified: bool = True  # answer failed verification twice -> forward
     require_user_id: bool = False  # True in production: conversations need an authenticated user
+    groups_claim: str = "groups"  # JWT claim with the user's groups -> document access (access.py)
     agent_webhook_secret: str | None = None  # HMAC key shared with the desk; webhook off if unset
     conversation_ttl_s: int = 24 * 3600  # how long agent messages / conversation mode are kept
 

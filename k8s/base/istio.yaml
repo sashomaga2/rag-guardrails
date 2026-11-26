@@ -20,8 +20,9 @@ metadata:
 spec:
   hosts: ["chat.northwind.example"]
   gateways: [rag-gateway]
-  http:
+  http:  # every route strips the identity headers: only the api sidecar sets them, from the verified JWT
     - name: stream
+      headers: {request: {remove: [x-user-id, x-jwt-payload]}}  # identity is set by the api sidecar
       match:
         - uri: {exact: /chat/stream}
       route:
@@ -31,12 +32,14 @@ spec:
     - name: agent-websocket  # long-lived; Istio upgrades WebSockets on HTTP routes by default
       match:
         - uri: {regex: "^/conversations/[^/]+/ws$"}
+      headers: {request: {remove: [x-user-id, x-jwt-payload]}}
       route:
         - destination: {host: rag-api, port: {number: 80}}
       timeout: 0s  # no route timeout; app pings every 15s, the client resumes with last_event_id
     - name: agent-webhook  # from the support desk; authenticated by HMAC signature in the app
       match:
         - uri: {exact: /agent/webhook}
+      headers: {request: {remove: [x-user-id, x-jwt-payload]}}
       route:
         - destination: {host: rag-api, port: {number: 80}}
       timeout: 10s
@@ -46,11 +49,13 @@ spec:
         - uri: {prefix: /chat}
         - uri: {exact: /handoff}
         - uri: {regex: "^/conversations/[^/]+/ws-ticket$"}
+      headers: {request: {remove: [x-user-id, x-jwt-payload]}}
       route:
         - destination: {host: rag-api, port: {number: 80}}
       timeout: 90s
       retries: {attempts: 0}
     - name: ui
+      headers: {request: {remove: [x-user-id, x-jwt-payload]}}
       route:
         - destination: {host: rag-api, port: {number: 80}}
       timeout: 10s
@@ -81,8 +86,11 @@ metadata:
 spec:
   mtls: {mode: STRICT}
 ---
-# The user id used for per-user limits comes from the verified JWT, never from the client:
-# outputClaimToHeaders writes the "sub" claim into X-User-Id (overwriting any client value).
+# Identity comes from the verified JWT, never from the client:
+#   outputClaimToHeaders   "sub" claim -> X-User-Id (per-user limits, conversation ownership)
+#   outputPayloadToHeader  verified payload (base64 JSON) -> X-Jwt-Payload; the app reads its
+#                          "groups" claim to decide which documents retrieval may search
+# Both are also stripped from client requests at the gateway (VirtualService above).
 apiVersion: security.istio.io/v1
 kind: RequestAuthentication
 metadata:
@@ -96,6 +104,7 @@ spec:
       forwardOriginalToken: false
       outputClaimToHeaders:
         - {header: X-User-Id, claim: sub}
+      outputPayloadToHeader: X-Jwt-Payload
 ---
 apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy

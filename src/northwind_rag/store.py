@@ -1,5 +1,6 @@
 """Knowledge base: Chroma (dense) + a lexical index (Elasticsearch / local BM25), fused with RRF,
-then reranked by a cross-encoder (see rerank.py).
+then reranked by a cross-encoder (see rerank.py). Every search is limited to the chunks the
+user's groups may read (see access.py).
 
 Ingestion writes the same chunk ids to both stores and removes stale chunks from both.
 Retrieval runs both searches in parallel; if the lexical side fails, it degrades to dense-only
@@ -20,6 +21,7 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
+from northwind_rag.access import acl_metadata, can_read, chroma_filter, document_groups, split_front_matter
 from northwind_rag.config import Settings
 from northwind_rag.fusion import rrf_merge
 from northwind_rag.lexical import ElasticsearchIndex, LexicalIndex, LocalBM25Index
@@ -78,7 +80,8 @@ class KnowledgeBase:
 
     # -- ingestion ------------------------------------------------------------
     def chunk_file(self, path: Path) -> list[Document]:
-        text = path.read_text(encoding="utf-8")
+        fields, text = split_front_matter(path.read_text(encoding="utf-8"))  # front matter is not indexed
+        acl = acl_metadata(document_groups(fields))
         sections = self._header_splitter.split_text(text)
         chunks = self._splitter.split_documents(sections)
         out = []
@@ -90,6 +93,7 @@ class KnowledgeBase:
                 "section": c.metadata.get("section", ""),
                 "chunk_id": chunk_id,
                 "content_hash": hashlib.sha256(c.page_content.encode()).hexdigest()[:16],
+                **acl,
             }
             c.id = chunk_id
             out.append(c)
@@ -135,19 +139,28 @@ class KnowledgeBase:
     def count(self) -> int:
         return len(self.vs.get(include=[])["ids"])
 
+    def unlabelled_sample(self, limit: int = 50) -> int:
+        """Chunks without an access label (ingested before access control) are hidden from every
+        user (fail closed). Returns how many of the first `limit` chunks lack one."""
+        metadatas = self.vs.get(limit=limit, include=["metadatas"])["metadatas"]
+        return sum(1 for m in metadatas if not (m or {}).get("access_groups"))
+
     # -- retrieval ------------------------------------------------------------
-    async def search(self, query: str) -> list[Document]:
-        """Stage 1 (recall): dense (above the relevance threshold) + lexical (minimum_should_match),
+    async def search(self, query: str, groups: frozenset[str] | set[str] = frozenset()) -> list[Document]:
+        """Only chunks readable by `groups` (+ public) are considered, in every store, before ranking.
+
+        Stage 1 (recall): dense (above the relevance threshold) + lexical (minimum_should_match),
         fused with RRF. Stage 2 (precision): the cross-encoder rescores the top
         `rerank_candidates`, drops those below `rerank_min_score` and re-orders the rest.
         Finally at most N chunks per source file, top-k."""
         s = self.settings
         query = _PLACEHOLDER_RE.sub(" ", query)  # "[REDACTED:email]" carries no meaning for retrieval
-        dense_task = self.vs.asimilarity_search_with_relevance_scores(query, k=s.fetch_k)
+        groups = frozenset(groups)
+        dense_task = self.vs.asimilarity_search_with_relevance_scores(query, k=s.fetch_k, filter=chroma_filter(groups))
         if self.lexical is None:
             dense, lexical, mode = await dense_task, [], "dense"
         else:
-            dense, lexical = await asyncio.gather(dense_task, self.lexical.search(query, s.fetch_k),
+            dense, lexical = await asyncio.gather(dense_task, self.lexical.search(query, s.fetch_k, groups),
                                                   return_exceptions=True)
             if isinstance(dense, BaseException):
                 raise dense
@@ -155,6 +168,8 @@ class KnowledgeBase:
             if isinstance(lexical, BaseException):  # degrade, don't fail the chat
                 log.warning("lexical search failed; using dense only", exc_info=lexical)
                 lexical, mode = [], "dense_fallback"
+        # defence in depth: the stores already filtered; anything else is a bug or a stale index
+        dense, lexical = self._readable(dense, groups), self._readable(lexical, groups)
 
         dense = [(d, sc) for d, sc in sorted(dense, key=lambda x: x[1], reverse=True) if sc >= s.relevance_threshold]
         dense_score = {d.metadata["chunk_id"]: sc for d, sc in dense}
@@ -194,6 +209,14 @@ class KnowledgeBase:
             if len(results) == s.top_k:
                 break
         return results
+
+    @staticmethod
+    def _readable(hits: list, groups: frozenset[str]) -> list:
+        kept = [(d, sc) for d, sc in hits if can_read(d.metadata, groups)]
+        if len(kept) != len(hits):
+            leaked = sorted({d.metadata.get("chunk_id") for d, _ in hits} - {d.metadata.get("chunk_id") for d, _ in kept})
+            log.error("access filter: store returned %d unreadable chunk(s), dropped: %s", len(hits) - len(kept), leaked)
+        return kept
 
     async def _rerank(self, query: str, candidates: list[Document]) -> tuple[list[Document], bool]:
         """Cross-encoder over the top RRF candidates. Returns (new order, reranked?). Chunks below

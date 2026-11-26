@@ -45,7 +45,7 @@ async def main(prefix: str, reps: int, concurrency: int, recreate: bool) -> None
         evaluators += make_llm_evaluators(pipeline.suite.judge)
 
     async def target(inputs: dict) -> dict:
-        return await pipeline.ask(inputs["question"])
+        return await pipeline.ask(inputs["question"], groups=inputs.get("groups"))
 
     results = await aevaluate(
         target,

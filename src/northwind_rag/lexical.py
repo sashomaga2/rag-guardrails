@@ -23,6 +23,7 @@ from typing import Protocol
 
 from langchain_core.documents import Document
 
+from northwind_rag.access import can_read, chunk_groups, readable_by
 from northwind_rag.textutil import content_tokens
 
 log = logging.getLogger(__name__)
@@ -31,7 +32,9 @@ log = logging.getLogger(__name__)
 class LexicalIndex(Protocol):
     def upsert(self, docs: list[Document]) -> None: ...
     def delete_source_except(self, source: str, keep_ids: list[str]) -> int: ...
-    async def search(self, query: str, k: int) -> list[tuple[Document, float]]: ...
+    async def search(self, query: str, k: int, groups: frozenset[str] = frozenset()) -> list[tuple[Document, float]]:
+        """Only chunks readable with `groups` (+ public) are searched (see access.py)."""
+        ...
     def count(self) -> int: ...
     async def ping(self) -> bool: ...
 
@@ -84,7 +87,7 @@ class LocalBM25Index:
             self._remove(cid)
         return len(stale)
 
-    async def search(self, query: str, k: int) -> list[tuple[Document, float]]:
+    async def search(self, query: str, k: int, groups: frozenset[str] = frozenset()) -> list[tuple[Document, float]]:
         terms = list(dict.fromkeys(content_tokens(query)))
         if not terms or not self._docs:
             return []
@@ -92,6 +95,8 @@ class LocalBM25Index:
         n, avg = len(self._docs), sum(self._len.values()) / len(self._docs)
         scored = []
         for cid, tf in self._tf.items():
+            if not can_read(self._docs[cid].metadata, groups):  # filter before ranking
+                continue
             matched = [t for t in terms if t in tf]
             if len(matched) < need:
                 continue
@@ -122,17 +127,24 @@ ES_MAPPINGS = {
         "source": {"type": "keyword"},
         "chunk_id": {"type": "keyword"},
         "content_hash": {"type": "keyword"},
+        "access_groups": {"type": "keyword"},  # who may read the chunk (array), see access.py
     },
 }
 
 
-def es_query(query: str, min_should_match: str) -> dict:
+def es_query(query: str, min_should_match: str, groups: frozenset[str] = frozenset()) -> dict:
     return {
-        "multi_match": {
-            "query": query,
-            "fields": ["content", "content.exact", "title^2", "section^2"],
-            "type": "most_fields",  # stemmed + exact both count: exact error strings rank higher
-            "minimum_should_match": min_should_match,
+        "bool": {
+            "must": {
+                "multi_match": {
+                    "query": query,
+                    "fields": ["content", "content.exact", "title^2", "section^2"],
+                    "type": "most_fields",  # stemmed + exact both count: exact error strings rank higher
+                    "minimum_should_match": min_should_match,
+                }
+            },
+            # access control inside the query (a filter: no effect on scores, cached by ES)
+            "filter": [{"terms": {"access_groups": readable_by(groups)}}],
         }
     }
 
@@ -149,10 +161,15 @@ class ElasticsearchIndex:
         self.aes = async_client or AsyncElasticsearch(url, request_timeout=5, **auth)
         self.index = index
         self.msm = min_should_match
+        self._mapping_checked = False
 
     def ensure_index(self) -> None:
         if not self.es.indices.exists(index=self.index):
             self.es.indices.create(index=self.index, settings=ES_SETTINGS, mappings=ES_MAPPINGS)
+        elif not self._mapping_checked:
+            # an index created before a new field (access_groups): adding fields is allowed
+            self.es.indices.put_mapping(index=self.index, properties=ES_MAPPINGS["properties"])
+        self._mapping_checked = True
 
     def upsert(self, docs: list[Document]) -> None:
         if not docs:
@@ -163,7 +180,8 @@ class ElasticsearchIndex:
             md = d.metadata
             ops.append({"index": {"_index": self.index, "_id": md["chunk_id"]}})
             ops.append({"content": d.page_content, "title": md.get("title", ""), "section": md.get("section", ""),
-                        "source": md.get("source", ""), "chunk_id": md["chunk_id"], "content_hash": md.get("content_hash", "")})
+                        "source": md.get("source", ""), "chunk_id": md["chunk_id"], "content_hash": md.get("content_hash", ""),
+                        "access_groups": sorted(chunk_groups(md))})
         resp = self.es.bulk(operations=ops, refresh="wait_for")
         if resp.get("errors"):
             failed = [i for i in resp["items"] if i.get("index", {}).get("error")]
@@ -179,14 +197,14 @@ class ElasticsearchIndex:
         )
         return int(resp.get("deleted", 0))
 
-    async def search(self, query: str, k: int) -> list[tuple[Document, float]]:
-        resp = await self.aes.search(index=self.index, query=es_query(query, self.msm), size=k,
+    async def search(self, query: str, k: int, groups: frozenset[str] = frozenset()) -> list[tuple[Document, float]]:
+        resp = await self.aes.search(index=self.index, query=es_query(query, self.msm, groups), size=k,
                                      source_excludes=["content_hash"])
         out = []
         for hit in resp["hits"]["hits"]:
             src = hit["_source"]
             md = {"source": src["source"], "title": src.get("title", ""), "section": src.get("section", ""),
-                  "chunk_id": src["chunk_id"]}
+                  "chunk_id": src["chunk_id"], "access_groups": ",".join(src.get("access_groups") or [])}
             out.append((Document(page_content=src["content"], metadata=md, id=src["chunk_id"]), float(hit["_score"])))
         return out
 

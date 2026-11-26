@@ -5,6 +5,7 @@ import shutil
 import pytest
 from langchain_core.documents import Document
 
+from northwind_rag.access import acl_metadata
 from northwind_rag.config import Settings
 from northwind_rag.fusion import rrf_merge
 from northwind_rag.lexical import ES_MAPPINGS, ElasticsearchIndex, LocalBM25Index, required_matches
@@ -12,9 +13,10 @@ from northwind_rag.models import HashingEmbeddings
 from northwind_rag.store import KnowledgeBase
 
 
-def doc(cid: str, text: str, source: str | None = None, title: str = "") -> Document:
+def doc(cid: str, text: str, source: str | None = None, title: str = "", groups=("public",)) -> Document:
     return Document(page_content=text, metadata={"chunk_id": cid, "source": source or cid.split("#")[0] + ".md",
-                                                 "title": title, "section": ""}, id=cid)
+                                                 "title": title, "section": "", **acl_metadata(frozenset(groups))},
+                    id=cid)
 
 
 # ----------------------------------------------------------------------------------- RRF
@@ -108,7 +110,7 @@ class FakeAsyncES:
         self.last = kw
         return {"hits": {"hits": [{"_score": 7.5, "_source": {"content": "Use Hardware Refresh.", "title": "Laptop",
                                                               "section": "Request", "source": "laptop.md",
-                                                              "chunk_id": "laptop#1"}}]}}
+                                                              "chunk_id": "laptop#1", "access_groups": ["public"]}}]}}
 
     async def ping(self):
         return True
@@ -143,7 +145,8 @@ def test_es_deletes_stale_chunks_of_a_source():
 async def test_es_search_query_and_parsing():
     idx = es_index()
     hits = await idx.search("Hardware Refresh catalog item", k=5)
-    mm = idx.aes.last["query"]["multi_match"]
+    mm = idx.aes.last["query"]["bool"]["must"]["multi_match"]
+    assert idx.aes.last["query"]["bool"]["filter"] == [{"terms": {"access_groups": ["public"]}}]
     assert mm["minimum_should_match"] == "2<60%" and "content.exact" in mm["fields"] and "title^2" in mm["fields"]
     d, score = hits[0]
     assert d.metadata["chunk_id"] == "laptop#1" and score == 7.5
@@ -159,7 +162,7 @@ class StaticLexical:
     def count(self): return len(self.hits)
     async def ping(self): return not self.fail
 
-    async def search(self, query, k):
+    async def search(self, query, k, groups=frozenset()):
         if self.fail:
             raise ConnectionError("es down")
         return self.hits

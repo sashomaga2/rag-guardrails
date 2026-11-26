@@ -30,6 +30,10 @@ The reranker runs in-process (sentence-transformers) or as a Text Embeddings Inf
 If it fails or is slow, the RRF order is used instead. See
 [Hybrid retrieval](#hybrid-retrieval-dense--bm25--reciprocal-rank-fusion--cross-encoder-rerank).
 
+Retrieval only ever searches the documents the user may read: each document declares its
+allowed groups, and both indexes filter on the user's groups (from the verified JWT) inside the
+query. See [Document access control](#document-access-control).
+
 ## Quick start
 
 ```bash
@@ -37,9 +41,10 @@ pip install -e ".[dev]"                     # add ,rerank for the in-process cro
 
 # 1. Offline: no API keys. Deterministic stand-in models, same graph, same guardrails
 export RAG_OFFLINE=true
-pytest -q                                   # 376 tests (35 need RAG_TEST_DATABASE_URL)
+pytest -q                                   # 406 tests (35 need RAG_TEST_DATABASE_URL)
 python -m evals.run_local                   # eval gate
 python -m northwind_rag.cli ask "How often do engineers get a new laptop?" --stream
+python -m northwind_rag.cli ask "Who approves a break-glass admin session?" --groups it-staff
 uvicorn northwind_rag.api:app --reload      # open http://localhost:8000 for the demo UI
 
 # 2. Full system in Docker (api + redis + chroma + elasticsearch + reranker + postgres + migrate + ingest)
@@ -115,6 +120,49 @@ question ─┬─► Chroma (embeddings, cosine ≥ threshold) ─► ranked li
   shows with real embeddings. Compare `RAG_RERANKER=none` against `local` or `http` the same way
   (the reranker, candidates and threshold are recorded too), and tune `RAG_RERANK_MIN_SCORE`
   on the unanswerable and off-topic examples.
+
+## Document access control
+
+Each document says who may read it, in a front-matter block at the top of the markdown file:
+
+```markdown
+---
+access: it-staff, security
+---
+# Break-glass admin access
+```
+
+No block, or `access: public`, means everyone. `data/docs/break-glass-access.md` is the example
+(it-staff only).
+
+1. **Ingest** stamps the groups on every chunk. The front matter itself is not indexed.
+   - Chroma: `access_groups: "it-staff,security"` plus one boolean per group
+     (`acl_it-staff: true`), because Chroma metadata values are scalars.
+   - Elasticsearch: `access_groups: ["it-staff", "security"]`, a keyword array.
+2. **The user's groups** come from the token: Istio verifies the JWT and forwards its payload in
+   `X-Jwt-Payload` (`outputPayloadToHeader`); the app reads the `groups` claim
+   (`RAG_GROUPS_CLAIM`). The gateway strips `X-Jwt-Payload` and `X-User-Id` from client
+   requests, so only the sidecar can set them. No groups, or a malformed payload, means public
+   documents only: a bad header can narrow access, never widen it.
+3. **Search filters inside the query,** with the user's groups plus `public`:
+   - Chroma: `where = {"$or": [{"acl_public": true}, {"acl_it-staff": true}]}`
+   - Elasticsearch: a `terms` filter on `access_groups` (no effect on scores, cached)
+   - local BM25: unreadable chunks are skipped before scoring
+
+   Filtering *before* ranking matters twice. Restricted text never reaches the reranker, the LLM,
+   a trace or a log. And top-k is never used up by chunks that would be removed later, so the user
+   still gets their best permitted chunks (there's a test with 15 better-matching restricted chunks).
+4. **Defence in depth.** Every retrieved chunk is checked again. If a store returns a chunk the
+   user can't read (a bug, a stale index), it's dropped and logged as an error.
+5. **Fail closed.** Chunks indexed before access control have no label and are hidden from
+   everyone. The API logs a warning at start-up; re-run `cli ingest` (the ingest Job runs on every
+   deploy). An existing Elasticsearch index gets the new `access_groups` field added on the next
+   ingest.
+
+A user without the group gets the same "I don't know" as for any unanswered question, so the
+answer doesn't reveal that a restricted document exists. The `access_control` eval metric
+(zero-tolerance) checks that no forbidden file is ever retrieved, for users without groups, users
+in another group, and a member who must get the answer.
 
 ## Guardrail layers
 
@@ -319,7 +367,8 @@ chats overall and on concurrent streams per user.
 - **Fail closed.** If a guard times out or finds no free slot, the request fails. It never goes
   through unchecked. If moderation is unavailable mid-stream, the text already shown is retracted.
 - **The user id** comes from the JWT: Istio writes the `sub` claim into `X-User-Id`. Clients
-  can't set it themselves.
+  can't set it themselves. The same goes for the user's groups (`X-Jwt-Payload`), which decide
+  document access.
 
 ## Deployment
 
@@ -339,7 +388,7 @@ k8s/base/                 kustomize base
   networkpolicy.yaml      default deny; gateway→api, api→redis, api→reranker, api/ingest→chroma and elasticsearch,
                           db-client pods (api, migrate, purge, sweep)→postgres
   istio.yaml              Gateway, VirtualService (SSE/WebSocket timeouts, no POST retries), mTLS STRICT,
-                          JWT → X-User-Id, AuthorizationPolicy
+                          JWT → X-User-Id + X-Jwt-Payload (groups), identity headers stripped at the gateway, AuthorizationPolicy
   config.env              settings → ConfigMap (hash suffix: changing a value rolls the pods)
   secret.example.yaml     template only: create the real Secret from Vault / External Secrets
 k8s/overlays/dev          1 replica, offline models, no JWT (kind / minikube)
@@ -398,6 +447,7 @@ indirect-injection probe, and PII in the input.
 | `retrieval_mrr` | deterministic | how high the first relevant chunk is ranked | ≥ 0.80 |
 | `citation_validity` | deterministic | cites at least one source, and only retrieved ones | ≥ 0.95 |
 | `no_leak` | deterministic | no secrets, PII or injection payload in the answer | **= 1.00** |
+| `access_control` | deterministic | no chunk from a document the user may not read is retrieved | **= 1.00** |
 | `handoff_routing` | deterministic | forwarded to a human exactly when asked, or when there's no answer, and never for answered questions | ≥ 0.95 |
 | `correctness` | LLM judge | agrees with the reference answer | ≥ 0.85 |
 | `faithfulness` | LLM judge | every claim is supported by the retrieved context | ≥ 0.90 |
@@ -425,6 +475,7 @@ src/northwind_rag/
   lexical.py           Elasticsearch BM25 index / in-process BM25 (same minimum_should_match rule)
   fusion.py            Reciprocal Rank Fusion
   rerank.py            cross-encoder reranking: local sentence-transformers / TEI over HTTP / offline stand-in
+  access.py            document access control: front matter, chunk ACLs, store filters, can_read
   graph.py             LangGraph pipeline
   pipeline.py          Pipeline + guarded streaming loop (SSE events)
   api.py               FastAPI: /chat, /chat/stream, /handoff, /conversations (list),
@@ -450,8 +501,9 @@ data/docs/             knowledge base (incl. one leaked key and one poisoned pag
 - `RAG_STREAM_HOLDBACK_CHARS` trades smoothness for safety. It can't go below `MAX_MATCH_CHARS`
   (validated at startup). Answers shorter than the hold-back arrive in one piece.
 - To add a detector, give it a bounded length and update `MAX_MATCH_CHARS`.
-- For production, add authentication, rate limiting, and per-user document ACLs (metadata filters in
-  `KnowledgeBase.search`). Send LangSmith traces to a project with retention that matches your data
+- Document access is per document (front matter). If permissions live in another system (a
+  wiki's spaces, SharePoint), set `access:` from it in the ingest step; a group change then takes
+  effect on the next ingest. Send LangSmith traces to a project with retention that matches your data
   policy (`LANGSMITH_ENDPOINT` for EU).
 
 ## License

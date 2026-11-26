@@ -1,4 +1,4 @@
-"""Command line: `python -m northwind_rag.cli ingest | migrate | purge [--days N] | sweep [--stale-after S] | ask "question" [--stream]`."""
+"""Command line: `python -m northwind_rag.cli ingest | migrate | purge [--days N] | sweep [--stale-after S] | ask "question" [--stream] [--groups g1,g2]`."""
 
 from __future__ import annotations
 
@@ -20,12 +20,12 @@ def _ingest() -> None:
     print(f"Ingested {report.files} files -> {report.chunks} chunks (removed {report.removed_stale} stale)")
 
 
-async def _ask(question: str, stream: bool) -> None:
+async def _ask(question: str, stream: bool, groups: list[str]) -> None:
     p = Pipeline.create()
     if not stream:
-        print(json.dumps({k: v for k, v in (await p.ask(question)).items() if k != "contexts"}, indent=2))
+        print(json.dumps({k: v for k, v in (await p.ask(question, groups=groups)).items() if k != "contexts"}, indent=2))
         return
-    async for ev in p.stream(question):
+    async for ev in p.stream(question, groups=groups):
         name, data = ev["event"], ev["data"]
         if name == "delta":
             sys.stdout.write(data["text"])
@@ -88,6 +88,7 @@ def main() -> None:
     ask = sub.add_parser("ask", help="ask a question")
     ask.add_argument("question")
     ask.add_argument("--stream", action="store_true")
+    ask.add_argument("--groups", default="", help="comma-separated groups, e.g. it-staff (default: public only)")
     args = parser.parse_args()
     if args.cmd == "ingest":
         _ingest()
@@ -98,7 +99,7 @@ def main() -> None:
     elif args.cmd == "sweep":
         asyncio.run(_sweep(args.stale_after))
     else:
-        asyncio.run(_ask(args.question, args.stream))
+        asyncio.run(_ask(args.question, args.stream, [g for g in args.groups.split(",") if g.strip()]))
 
 
 if __name__ == "__main__":
