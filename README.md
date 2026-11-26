@@ -12,8 +12,10 @@ START → prepare ─┬→ classify_input (regex → LLM) ─┬→ gate ─→
   (validate,     └→ retrieve (hybrid + rerank) ───┘    ├─→ handoff (user asked) ─────────→ END
    redact PII)      + drop injected chunks             ├─→ no_context ──→ handoff ───────→ END
                     + mask secrets in chunks           └─→ generate ──→ check_output ────→ END
-                                                             ▲  (streams)   │  └─→ handoff → END
-                                                             └── 1 retry ───┘  (no answer / unverified)
+                                                          ▲  ▲  (streams)   │  │  └─→ handoff → END
+                                                          │  └─ regenerate ─┘  │  (no answer / unverified)
+                                                          └─── reretrieve ◄────┘  (1 retry, by failure type)
+                                                                 └─→ handoff (nothing new found)
 ```
 
 `classify_input` and `retrieve` run **in parallel**, so the LLM guard adds no latency.
@@ -41,7 +43,7 @@ pip install -e ".[dev]"                     # add ,rerank for the in-process cro
 
 # 1. Offline: no API keys. Deterministic stand-in models, same graph, same guardrails
 export RAG_OFFLINE=true
-pytest -q                                   # 406 tests (35 need RAG_TEST_DATABASE_URL)
+pytest -q                                   # 417 tests (35 need RAG_TEST_DATABASE_URL)
 python -m evals.run_local                   # eval gate
 python -m northwind_rag.cli ask "How often do engineers get a new laptop?" --stream
 python -m northwind_rag.cli ask "Who approves a break-glass admin session?" --groups it-staff
@@ -174,7 +176,7 @@ in another group, and a member who must get the answer.
 | 4 | Indirect-injection screening + secret masking of chunks | `retrieve` | regex | poisoned wiki pages; leaked keys in docs never reach the model | ~0 ms |
 | 5 | Streaming redaction with hold-back buffer | API stream | regex, blocking | secrets/PII split across tokens | delays text by up to 128 characters |
 | 6 | Streaming moderation with retraction | API stream | async LLM | credential phishing, security bypass | non-blocking |
-| 7 | End-of-stream checks + corrective retry | `check_output` | regex + LLM | invalid/missing citations, ungrounded claims | 1 LLM call |
+| 7 | End-of-stream checks + corrective retry (by failure type) | `check_output`, `reretrieve` | regex + LLM | invalid/missing citations, ungrounded claims, missing context | 1 LLM call (+1 retry) |
 
 ### How the streaming guardrails work
 
@@ -190,6 +192,31 @@ in another group, and a member who must get the answer.
 - **Verification after the stream (layer 7).** Citations and groundedness need the full answer. The
   client shows the answer as pending, then receives `verified`, or `retract` and a regenerated answer
   (one retry with feedback), or `retract` with a safe fallback.
+
+### Corrective retry: regenerate or retrieve again
+
+Regenerating on the same chunks only fixes **generation** mistakes. If the answer isn't in the
+context, a rewrite can't add it. So `check_output` picks the retry by what failed:
+
+| Failure | Retry | Why |
+|---|---|---|
+| Citations only (none, or ids not in the context); grounding fine | `regenerate`: same chunks, feedback in the prompt | the context was fine, the model formatted it wrong |
+| Some claims unsupported, grounding score ≥ `RAG_RERETRIEVE_BELOW_GROUNDING` (0.5) | `regenerate` | overreach on good context: trim to what the chunks say |
+| Grounding score < 0.5 (most claims unsupported) | `reretrieve`, then `regenerate` | the context is the problem |
+
+`reretrieve` runs the **same question** with wider limits: `RAG_RETRY_FETCH_K` (24) per store,
+`RAG_RETRY_RERANK_CANDIDATES` (40) to the cross-encoder, `RAG_RETRY_TOP_K` (8) and
+`RAG_RETRY_MAX_CHUNKS_PER_SOURCE` (4). That brings back near-misses, typically the neighbouring
+chunk of a file that hit the 2-per-file cap. The relevance thresholds don't change, so off-topic
+chunks still stay out, and the new chunks go through the same injection screening and secret
+masking. The query isn't rewritten: a longer query would make the BM25 `minimum_should_match` rule
+stricter and lose recall.
+
+If the wider search finds **no chunk the first attempt didn't already have**, another generation
+could only rephrase the same evidence. The run stops there and hands off (`unverified_answer`),
+without paying for a second generation. `RAG_MAX_GENERATION_ATTEMPTS` (2) still caps the total, and
+`RAG_RERETRIEVE_BELOW_GROUNDING=0` turns widening off. The run summary has `attempts` and
+`reretrieved`, so the evals and LangSmith traces show which path ran.
 
 ## Live agent handoff
 
@@ -498,6 +525,9 @@ data/docs/             knowledge base (incl. one leaked key and one poisoned pag
 
 - `RAG_MIN_RELEVANCE`: tune it with `retrieval_recall` and `behavior` on the unanswerable set. Too
   high and you lose answers; too low and the model gets distracting context.
+- `RAG_RERETRIEVE_BELOW_GROUNDING`: count how often runs with `reretrieved: true` end `answered`.
+  If they rarely do, lower it (or set 0) and hand off sooner. If many regenerations still fail,
+  raise it. The `RAG_RETRY_*` limits must be at least the normal ones (validated at startup).
 - `RAG_STREAM_HOLDBACK_CHARS` trades smoothness for safety. It can't go below `MAX_MATCH_CHARS`
   (validated at startup). Answers shorter than the hold-back arrive in one piece.
 - To add a detector, give it a bounded length and update `MAX_MATCH_CHARS`.

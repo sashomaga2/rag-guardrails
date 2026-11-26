@@ -4,15 +4,22 @@ r"""The RAG pipeline as a LangGraph state machine.
                        |                     |       |--> handoff (user asked) ----------> END
                        +--> retrieve --------+       |--> no_context --> handoff --------> END
                                                      \--> generate --> check_output -----> END
-                                                              ^              |  \--> handoff --> END
-                                                              +-- retry -----+    (no answer / unverified)
+                                                           ^  ^              |  |  \--> handoff --> END
+                                                           |  +- regenerate -+  |   (no answer / unverified)
+                                                           +-- reretrieve <-----+
+                                                                   \--> handoff (nothing new found)
 
 - prepare:        deterministic validation + PII redaction (only the sanitized question flows on)
 - classify_input  and retrieve run in PARALLEL: the LLM guard adds no latency to retrieval.
 - gate:           join point; routes on the guard verdict and on whether any context survived.
 - retrieve:       Chroma search + indirect-injection screening + secret masking of chunks.
 - generate:       the only node whose tokens are streamed to the user.
-- check_output:   redaction, citation validation, groundedness; one corrective retry.
+- check_output:   redaction, citation validation, groundedness; one corrective retry, chosen by
+                  failure type: citation problems or a few unsupported claims -> regenerate with
+                  feedback on the same context; low grounding -> the context is the problem -> reretrieve.
+- reretrieve:     the same question with wider limits (more candidates, larger top-k, looser
+                  per-file cap). If it finds no chunk the first attempt didn't have, another
+                  generation could only rephrase the same evidence, so it gives up (handoff) at once.
 - handoff:        forwards the (sanitized) conversation to a human via LiveAgentService when the
                   user asks for a person, the KB has no answer, or no verified answer was produced.
 """
@@ -74,6 +81,8 @@ class RAGState(TypedDict, total=False):
     answer: str
     attempts: int
     feedback: str | None
+    retry_mode: Literal["regenerate", "reretrieve"] | None
+    reretrieved: bool
     # verification
     citations: list[str]
     grounding_score: float
@@ -133,6 +142,18 @@ def build_graph(
         screened = screen_documents(docs)
         return {"documents": screened.kept, "dropped_documents": screened.dropped}
 
+    async def reretrieve(state: RAGState) -> RAGState:
+        stage("widening_retrieval")
+        docs = await kb.search(state["sanitized_question"], groups=frozenset(state.get("user_groups") or ()), wide=True)
+        screened = screen_documents(docs)
+        seen = {d.metadata["chunk_id"] for d in state["documents"]}
+        known_dropped = {d["chunk_id"] for d in state.get("dropped_documents", [])}
+        dropped = [*state.get("dropped_documents", []), *(d for d in screened.dropped if d["chunk_id"] not in known_dropped)]
+        if not any(d.metadata["chunk_id"] not in seen for d in screened.kept):
+            log.info("wider retrieval found no new chunks; not regenerating")
+            return {**unverified(), "reretrieved": True, "dropped_documents": dropped}
+        return {"documents": screened.kept, "dropped_documents": dropped, "reretrieved": True}
+
     def gate(state: RAGState) -> RAGState:
         return {}
 
@@ -188,15 +209,26 @@ def build_graph(
         if grounding.unsupported:
             problems.append(f"these claims are not supported: {grounding.unsupported}")
         if state["attempts"] < settings.max_generation_attempts:
-            return {**result, "status": "retrying", "feedback": "; ".join(problems)}
+            # Most claims unsupported: the same context can't fix that, only different context can.
+            widen = not state.get("reretrieved") and grounding.score < settings.reretrieve_below_grounding
+            return {**result, "status": "retrying", "feedback": "; ".join(problems),
+                    "retry_mode": "reretrieve" if widen else "regenerate"}
+        return {**result, **unverified()}
+
+    def unverified() -> RAGState:
         if settings.handoff_on_unverified:
-            return {**result, "status": "ungrounded", "final_answer": UNVERIFIED_SHORT, "handoff_reason": "unverified_answer"}
-        return {**result, "status": "ungrounded", "final_answer": UNVERIFIED_ANSWER}
+            return {"status": "ungrounded", "final_answer": UNVERIFIED_SHORT, "handoff_reason": "unverified_answer"}
+        return {"status": "ungrounded", "final_answer": UNVERIFIED_ANSWER}
 
     def route_after_check(state: RAGState) -> str:
         if state["status"] == "retrying":
-            return "generate"
+            return "reretrieve" if state.get("retry_mode") == "reretrieve" else "generate"
         return "handoff" if state.get("handoff_reason") else END
+
+    def route_after_reretrieve(state: RAGState) -> str:
+        if state["status"] == "ungrounded":
+            return route_to_handoff(state)
+        return "generate"
 
     def route_to_handoff(state: RAGState) -> str:
         return "handoff" if state.get("handoff_reason") else END
@@ -241,6 +273,7 @@ def build_graph(
     g.add_node("no_context", no_context)
     g.add_node("generate", generate)
     g.add_node("check_output", check_output)
+    g.add_node("reretrieve", reretrieve)
     g.add_node("handoff", handoff)
 
     g.add_edge(START, "prepare")
@@ -251,7 +284,8 @@ def build_graph(
     g.add_edge("refuse", END)
     g.add_conditional_edges("no_context", route_to_handoff, ["handoff", END])
     g.add_edge("generate", "check_output")
-    g.add_conditional_edges("check_output", route_after_check, ["generate", "handoff", END])
+    g.add_conditional_edges("check_output", route_after_check, ["generate", "reretrieve", "handoff", END])
+    g.add_conditional_edges("reretrieve", route_after_reretrieve, ["generate", "handoff", END])
     g.add_edge("handoff", END)
     return g.compile()
 
@@ -273,5 +307,6 @@ def summarize(state: RAGState) -> dict[str, Any]:
         "grounding_score": state.get("grounding_score"),
         "unsupported_claims": state.get("unsupported_claims", []),
         "attempts": state.get("attempts", 0),
+        "reretrieved": state.get("reretrieved", False),
         "handoff": state.get("handoff"),
     }

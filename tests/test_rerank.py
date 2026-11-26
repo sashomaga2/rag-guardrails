@@ -212,6 +212,23 @@ async def test_per_source_cap_applies_after_reranking(make_kb):
     assert ids(results) == ["a#0", "a#1", "b#0"]  # third a.md chunk skipped for diversity
 
 
+async def test_wide_search_relaxes_the_limits_for_the_corrective_retry(make_kb):
+    r = ScriptedReranker({"alpha chunk": 0.9, "alpha second chunk": 0.85, "alpha third chunk": 0.8,
+                          "beta chunk": 0.7, "gamma chunk": 0.01})
+    kb = make_kb([A, A2, A3, B, C], r, top_k=2, max_chunks_per_source=1, offline_rerank_min_score=0.2,
+                 retry_top_k=5, retry_max_chunks_per_source=3)
+    assert ids(await kb.search("question")) == ["a#0", "b#0"]
+    # neighbouring chunks of the same file come back; the relevance threshold still drops gamma
+    assert ids(await kb.search("question", wide=True)) == ["a#0", "a#1", "a#2", "b#0"]
+
+
+def test_retry_limits_can_only_widen():
+    with pytest.raises(ValueError, match="retry_top_k"):
+        Settings(offline=True, top_k=4, retry_top_k=2)
+    with pytest.raises(ValueError, match="retry_rerank_candidates"):
+        Settings(offline=True, retry_top_k=8, retry_rerank_candidates=4)
+
+
 async def test_pipeline_answers_from_the_reranked_chunks(pipeline):
     question = "How long is my account locked after failed logins?"
     docs = await pipeline.kb.search(question)

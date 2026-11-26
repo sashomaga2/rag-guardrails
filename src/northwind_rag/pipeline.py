@@ -171,7 +171,7 @@ class Pipeline:
                             yield {"event": "blocked", "data": {"answer": update["final_answer"], "label": final_state.get("input_label")}}
                         elif node == "no_context":
                             yield {"event": "final", "data": {"status": "no_context", "answer": update["final_answer"]}}
-                        elif node == "check_output":
+                        elif node in ("check_output", "reretrieve"):  # reretrieve: only "ungrounded" (nothing new found)
                             status = update.get("status")
                             if status == "retrying":
                                 yield {"event": "retract", "data": {"reason": "regenerating"}}

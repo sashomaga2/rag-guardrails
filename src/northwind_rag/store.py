@@ -146,21 +146,26 @@ class KnowledgeBase:
         return sum(1 for m in metadatas if not (m or {}).get("access_groups"))
 
     # -- retrieval ------------------------------------------------------------
-    async def search(self, query: str, groups: frozenset[str] | set[str] = frozenset()) -> list[Document]:
+    async def search(self, query: str, groups: frozenset[str] | set[str] = frozenset(), *,
+                     wide: bool = False) -> list[Document]:
         """Only chunks readable by `groups` (+ public) are considered, in every store, before ranking.
 
         Stage 1 (recall): dense (above the relevance threshold) + lexical (minimum_should_match),
         fused with RRF. Stage 2 (precision): the cross-encoder rescores the top
         `rerank_candidates`, drops those below `rerank_min_score` and re-orders the rest.
-        Finally at most N chunks per source file, top-k."""
+        Finally at most N chunks per source file, top-k.
+
+        `wide=True` (corrective retry) uses the larger retry_* limits. The relevance thresholds
+        stay the same, so widening finds near-misses, never off-topic chunks."""
         s = self.settings
+        fetch_k = s.retry_fetch_k if wide else s.fetch_k
         query = _PLACEHOLDER_RE.sub(" ", query)  # "[REDACTED:email]" carries no meaning for retrieval
         groups = frozenset(groups)
-        dense_task = self.vs.asimilarity_search_with_relevance_scores(query, k=s.fetch_k, filter=chroma_filter(groups))
+        dense_task = self.vs.asimilarity_search_with_relevance_scores(query, k=fetch_k, filter=chroma_filter(groups))
         if self.lexical is None:
             dense, lexical, mode = await dense_task, [], "dense"
         else:
-            dense, lexical = await asyncio.gather(dense_task, self.lexical.search(query, s.fetch_k, groups),
+            dense, lexical = await asyncio.gather(dense_task, self.lexical.search(query, fetch_k, groups),
                                                   return_exceptions=True)
             if isinstance(dense, BaseException):
                 raise dense
@@ -195,18 +200,21 @@ class KnowledgeBase:
             )
             candidates.append(doc)
 
-        candidates, reranked = await self._rerank(query, candidates)
+        candidates, reranked = await self._rerank(query, candidates,
+                                                  s.retry_rerank_candidates if wide else s.rerank_candidates)
 
+        top_k = s.retry_top_k if wide else s.top_k
+        max_per_source = s.retry_max_chunks_per_source if wide else s.max_chunks_per_source
         results: list[Document] = []
         per_source: dict[str, int] = {}
         for doc in candidates:
             src = doc.metadata.get("source", "")
-            if per_source.get(src, 0) >= s.max_chunks_per_source:
+            if per_source.get(src, 0) >= max_per_source:
                 continue
             per_source[src] = per_source.get(src, 0) + 1
             doc.metadata["reranked"] = reranked
             results.append(doc)
-            if len(results) == s.top_k:
+            if len(results) == top_k:
                 break
         return results
 
@@ -218,13 +226,13 @@ class KnowledgeBase:
             log.error("access filter: store returned %d unreadable chunk(s), dropped: %s", len(hits) - len(kept), leaked)
         return kept
 
-    async def _rerank(self, query: str, candidates: list[Document]) -> tuple[list[Document], bool]:
-        """Cross-encoder over the top RRF candidates. Returns (new order, reranked?). Chunks below
-        the threshold are dropped, so an off-topic question can end with no context at all."""
+    async def _rerank(self, query: str, candidates: list[Document], pool_size: int) -> tuple[list[Document], bool]:
+        """Cross-encoder over the top `pool_size` RRF candidates. Returns (new order, reranked?).
+        Chunks below the threshold are dropped, so an off-topic question can end with no context at all."""
         s = self.settings
         if self.reranker is None or not candidates:
             return candidates, False
-        pool = candidates[: s.rerank_candidates]
+        pool = candidates[:pool_size]
         try:
             async with asyncio.timeout(s.rerank_timeout_s):
                 scores = await self.reranker.score(query, [d.page_content for d in pool])

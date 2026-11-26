@@ -68,6 +68,13 @@ class Settings(BaseSettings):
     # --- Guardrails ---------------------------------------------------------
     max_question_chars: int = 2000
     max_generation_attempts: int = 2  # 1 retry when groundedness check fails
+    # Corrective retry: a grounding score below this means the context, not the wording, is the
+    # problem -> retrieve again with the wider retry_* limits before regenerating. 0 disables.
+    reretrieve_below_grounding: float = 0.5
+    retry_fetch_k: int = 24
+    retry_rerank_candidates: int = 40
+    retry_top_k: int = 8
+    retry_max_chunks_per_source: int = 4
     stream_holdback_chars: int = 128  # must be >= patterns.MAX_MATCH_CHARS
     moderation_every_chars: int = 240  # run streaming moderation every N chars
     allowed_email_domains: list[str] = Field(default_factory=lambda: ["northwind.example"])
@@ -125,6 +132,12 @@ class Settings(BaseSettings):
             )
         if self.reranker != "none" and self.rerank_candidates < self.top_k:
             raise ValueError(f"rerank_candidates ({self.rerank_candidates}) must be >= top_k ({self.top_k})")
+        if (self.retry_top_k < self.top_k or self.retry_fetch_k < self.fetch_k
+                or self.retry_max_chunks_per_source < self.max_chunks_per_source):
+            raise ValueError("retry_top_k / retry_fetch_k / retry_max_chunks_per_source must be >= their normal values "
+                             "(the corrective retry widens retrieval, it never narrows it)")
+        if self.reranker != "none" and self.retry_rerank_candidates < self.retry_top_k:
+            raise ValueError(f"retry_rerank_candidates ({self.retry_rerank_candidates}) must be >= retry_top_k ({self.retry_top_k})")
         if self.turn_stale_after_s < 3 * self.turn_heartbeat_s:
             raise ValueError(
                 f"turn_stale_after_s ({self.turn_stale_after_s}) must be >= 3 x turn_heartbeat_s "

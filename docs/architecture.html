@@ -44,7 +44,7 @@
 
 <section id="pipeline">
   <h2>1. LangGraph request pipeline</h2>
-  <p class="sub">Input classification and retrieval run in parallel, so the LLM guard adds no latency. Every exit path ends with a refusal, a verified answer or a human handoff.</p>
+  <p class="sub">Input classification and retrieval run in parallel, so the LLM guard adds no latency. Every exit path ends with a refusal, a verified answer or a human handoff. One corrective retry, chosen by failure type: regenerate on the same chunks, or retrieve wider first when most claims are unsupported.</p>
   <pre class="mermaid">
 flowchart LR
   START((User question)):::start --> PREP["prepare<br/><small>validate · redact PII &amp; secrets</small>"]:::guard
@@ -58,7 +58,10 @@ flowchart LR
   GATE -- "ok" --> GEN["generate<br/><small>streams tokens</small>"]:::llm
   NC --> HO
   GEN --> CHK["check_output<br/><small>citations · groundedness</small>"]:::guard
-  CHK -- "fail (1 retry)" --> GEN
+  CHK -- "citations / some claims<br/>(regenerate)" --> GEN
+  CHK -- "low grounding" --> RR["reretrieve<br/><small>same question, wider limits<br/>larger top-k · looser per-file cap</small>"]:::retr
+  RR -- "new chunks" --> GEN
+  RR -- "nothing new" --> HO
   CHK -- "verified" --> OK(("Answer ✓")):::ok
   CHK -- "no answer / unverified" --> HO
   REF --> END((END)):::start
