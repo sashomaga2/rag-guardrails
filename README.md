@@ -1,4 +1,4 @@
-# Northwind RAG: LangGraph + Chroma + guarded streaming + LangSmith evals
+# Northwind RAG: LangGraph + hybrid retrieval + cross-encoder rerank + guarded streaming + LangSmith evals
 
 This is a production-style RAG reference: an IT helpdesk assistant over a small internal knowledge base.
 It answers only from retrieved documents and cites every fact, and hands the conversation to a human
@@ -9,7 +9,7 @@ suite that runs locally (CI gate) and in LangSmith (experiments).
 ```
         ┌──────────── input guardrails ─────────────┐   ┌─ retrieval guardrails ─┐
 START → prepare ─┬→ classify_input (regex → LLM) ─┬→ gate ─→ refuse ───────────────────────→ END
-  (validate,     └→ retrieve (Chroma, threshold) ─┘    ├─→ handoff (user asked) ─────────→ END
+  (validate,     └→ retrieve (hybrid + rerank) ───┘    ├─→ handoff (user asked) ─────────→ END
    redact PII)      + drop injected chunks             ├─→ no_context ──→ handoff ───────→ END
                     + mask secrets in chunks           └─→ generate ──→ check_output ────→ END
                                                              ▲  (streams)   │  └─→ handoff → END
@@ -17,21 +17,32 @@ START → prepare ─┬→ classify_input (regex → LLM) ─┬→ gate ─→
 ```
 
 `classify_input` and `retrieve` run **in parallel**, so the LLM guard adds no latency.
-`retrieve` is **hybrid**: Chroma vectors and Elasticsearch BM25, merged with Reciprocal Rank Fusion.
+
+`retrieve` works in **two stages**:
+
+1. **Recall.** Chroma vectors and Elasticsearch BM25 search in parallel, and their results are
+   merged with Reciprocal Rank Fusion.
+2. **Precision.** A **cross-encoder** rescores the top 20 merged chunks, reading the question and
+   each chunk together. It drops chunks below a relevance cutoff, so off-topic questions get no
+   context and lead to "I don't know" or a handoff, and keeps the best 4 (at most 2 per file).
+
+The reranker runs in-process (sentence-transformers) or as a Text Embeddings Inference service.
+If it fails or is slow, the RRF order is used instead. See
+[Hybrid retrieval](#hybrid-retrieval-dense--bm25--reciprocal-rank-fusion--cross-encoder-rerank).
 
 ## Quick start
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev]"                     # add ,rerank for the in-process cross-encoder (pulls in torch)
 
 # 1. Offline: no API keys. Deterministic stand-in models, same graph, same guardrails
 export RAG_OFFLINE=true
-pytest -q                                   # 322 tests (16 need RAG_TEST_DATABASE_URL)
+pytest -q                                   # 376 tests (35 need RAG_TEST_DATABASE_URL)
 python -m evals.run_local                   # eval gate
 python -m northwind_rag.cli ask "How often do engineers get a new laptop?" --stream
 uvicorn northwind_rag.api:app --reload      # open http://localhost:8000 for the demo UI
 
-# 2. Full system in Docker (api + redis + chroma + elasticsearch + postgres + migrate + ingest)
+# 2. Full system in Docker (api + redis + chroma + elasticsearch + reranker + postgres + migrate + ingest)
 RAG_OFFLINE=true docker compose up --build  # http://localhost:8080
 
 # 3. Real models + LangSmith
